@@ -5,6 +5,7 @@ import { setCurrentDbClient, clearCurrentDbClient } from '../../localDb/client/c
 import { saveAgentInputQueueSnapshot, awaitAgentInputQueueSnapshotPersistence, readInputDeliveryReceipts, loadAgentInputQueueSnapshot, saveCancelledInputDelivery } from '../../localDb/agentInputQueueSnapshots.js';
 import { createInputEnqueueHarness, createInputStopHarness, createSavedQuotaRestoreHarness } from './inputEnqueueHarness.js';
 import { runSessionExecutionAction } from '../sessionExecutionActions.js';
+import { stripTaskDispatchOrigin } from '../taskDispatchReceipt.js';
 import { createSharedPermission } from '../sharedPermission.js';
 import type { InteractionDecision } from '@cindy/maker-core';
 import { getMainClassicalStyle, getResolvedMainLocale } from '../../i18n.desktop.js';
@@ -15267,10 +15268,10 @@ describe('Orca report durable recovery', () => {
     const source = readFileSync(resolve(__dirname, '..', 'register.ts'), 'utf8');
     const start = source.indexOf('  const requireQueuedMessage = (');
     const end = source.indexOf('  ipcMain.handle(DL_SESSION_REFERENCE_CAPABILITY_CHANNEL', start);
-    const parse = new Function('throwIpcError', 'requireSessionRefs', 'isDeviceLinkInvoke', transpileModule(
+    const parse = new Function('throwIpcError', 'requireSessionRefs', 'isDeviceLinkInvoke', 'stripTaskDispatchOrigin', transpileModule(
       `${source.slice(start, end)}\nreturn requireQueuedMessage;`,
       { compilerOptions: { target: ScriptTarget.ES2022 } },
-    ).outputText)((code: string) => { throw new Error(code); }, () => [], () => false);
+    ).outputText)((code: string) => { throw new Error(code); }, () => [], () => false, stripTaskDispatchOrigin);
     const h = createHarness({ canRestoreOrcaReport: async () => true });
     const parsed = parse(Object.assign(report(), { orcaReportDeliveryFence: true }));
     expect(parsed).not.toHaveProperty('orcaReportDeliveryFence');

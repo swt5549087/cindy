@@ -6,6 +6,7 @@ import path from 'node:path';
 import { captureAgentRequest } from '../forwardedRequest.js';
 import { createRemoteSessionHandoff } from '../../mcp-integrations/sessionHandoffRemote.js';
 import { validateRemoteTaskActionReceipt } from '../remoteTaskActionReceipt.js';
+import { TASK_STATUS_RECEIPT_OPERATION, taskDispatchInput } from '../taskDispatchReceipt.js';
 import { bindTaskActionInput, settleTaskActionInput, taskActionInputGuard } from '../taskActionAuthorization.js';
 import type { AgentInputQueuedMessage } from '../../../shared/agentInputQueue.js';
 import { SUPPORTED_LOCALES } from '../../../shared/locale.js';
@@ -81,7 +82,9 @@ function creationFixture() {
 describe('maker:session:handoff (receiving computer)', () => {
   // Unit: exercise the receiving production handler and opener together. Replay/validation
   // failures must not create twice, and source authority is checked immediately before commit.
-  it('creates an ordinary destination task once, then uses the existing message queue', async () => {
+  // The existing create wire from an old caller has no parent field. The
+  // receiving host must bind the authenticated sender on the first queued input.
+  it('creates a remote task once and binds its first input from unchanged older-client wire', async () => {
     const { id, rows, insert, deps } = creationFixture();
     const send = vi.fn(async () => ({ ok: true as const, agentKind: 'codex', wakeKind: 'queued' as const,
       targetTitle: 'Work', targetLastUserSendAt: null }));
@@ -93,7 +96,8 @@ describe('maker:session:handoff (receiving computer)', () => {
       workingDir: '/destination/project', workspaceKind: 'project' });
     expect(rows.get(id)).not.toHaveProperty('orcaRemoteLead');
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ targetSessionId: id, forceQueue: true,
-      origin: expect.objectContaining({ senderSessionId: 'source-device::sender-1' }) }));
+      clientId: `remote-task-action:task-dispatch:${id}`,
+      origin: expect.objectContaining({ senderSessionId: 'source-device::sender-1', dispatchedChildSessionId: id }) }));
     expect(await handle('source-device', wire)).toMatchObject({ ok: false, errorCode: 'DELIVERY_UNKNOWN' });
     expect(await handle('source-device', { ...wire, taskActionReceipt: 'new-receipt' }))
       .toMatchObject({ ok: false, errorCode: 'DELIVERY_UNKNOWN' });
@@ -108,6 +112,45 @@ describe('maker:session:handoff (receiving computer)', () => {
     expect(await createSessionHandoffHandler({ create, send, validate: async () => false })('source', wire))
       .toMatchObject({ ok: false, errorCode: 'UNSUPPORTED_CAPABILITY' });
     expect(create).not.toHaveBeenCalled(); expect(send).not.toHaveBeenCalled();
+  });
+
+  // Unit/protocol: use the real sender and receiving handler. The same receipt
+  // transport must downgrade before sending to old peers and stop if the target
+  // becomes shared before queued delivery.
+  it.each([false, true])('negotiates a status-only receipt with a destination host (supports: %s)', async (supported) => {
+    const send = vi.fn<Parameters<typeof createSessionHandoffHandler>[0]['send']>(async () => ({
+      ok: true, agentKind: 'codex', wakeKind: 'queued', targetTitle: 'parent', targetLastUserSendAt: null,
+    }));
+    let shared = false;
+    const validate = vi.fn((_sender: string, input: Parameters<typeof validateRemoteTaskActionReceipt>[1]) =>
+      validateRemoteTaskActionReceipt('parent-device', input));
+    const receive = createSessionHandoffHandler({ send, validate, canReceiveTaskStatusReceipt: () => !shared });
+    const invoke = vi.fn<Parameters<typeof createRemoteSessionHandoff>[0]['invoke']>(async (_device, _channel, args) =>
+      (args[0] as { action?: string }).action === 'task-action-capability'
+      ? { ok: true as const, result: { taskActionVersion: 1, ...(supported ? { taskStatusReceipt: 1 } : {}) } }
+      : { ok: true as const, result: await receive('child-device', args[0]) });
+    const captureRequest = vi.fn();
+    const handoff = createRemoteSessionHandoff({ invoke, captureRequest, captureAccess: () => () => {} });
+    const result = await handoff({ deviceId: 'parent-device', sessionId: 'parent' }, {
+      taskStatusReceipt: true, message: 'Work finished', sender: async () => ({ sessionId: 'child' }),
+    });
+    expect(captureRequest).not.toHaveBeenCalled();
+    if (!supported) {
+      expect(result).toMatchObject({ ok: false, errorCode: 'REMOTE_UNSUPPORTED' });
+      expect(invoke).toHaveBeenCalledOnce();
+      expect(send).not.toHaveBeenCalled();
+      return;
+    }
+    expect(result).toMatchObject({ ok: true, wakeKind: 'queued' });
+    expect(validate).toHaveBeenCalledWith('child-device', expect.objectContaining({ operation: TASK_STATUS_RECEIPT_OPERATION }));
+    const received = send.mock.calls[0]![0];
+    expect(received).toMatchObject({ inheritTargetPlanMode: true, origin: {
+      kind: 'session', senderSessionId: 'child-device::child', automaticTaskReceipt: true,
+    } });
+    expect(taskDispatchInput({ clientId: 'return', origin: received.origin })).toBeUndefined();
+    shared = true;
+    await expect(received.taskActionDeliveryGuard!()).rejects.toThrow('TASK_STATUS_RECEIPT_UNAVAILABLE');
+    await received.taskActionDeliveryGuard?.onSettled?.();
   });
 
   // Unit regression: execution in an existing managed worktree is valid even though
@@ -256,6 +299,7 @@ describe('maker:session:handoff (receiving computer)', () => {
       message: 'hello',
       origin: {
         kind: 'session',
+        taskDispatch: true,
         senderSessionId: 'device-A::sender-1',
         senderSessionTitle: 'PR 跟进',
         displayText: 'hello',

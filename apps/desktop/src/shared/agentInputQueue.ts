@@ -404,6 +404,12 @@ export interface AgentInputQueuedMessage {
         /** 来源会话属于某个伙伴时的伙伴身份快照；接收方标签改显示伙伴名与头像。 */
         senderBotId?: string;
         senderBotName?: string;
+        /** An ordinary handoff dispatched by the Host's session tool. */
+        taskDispatch?: true;
+        /** Host stamps the first dispatched input with the newly created task's ID. */
+        dispatchedChildSessionId?: string;
+        /** A Host-generated status update cannot itself request a return receipt. */
+        automaticTaskReceipt?: true;
         /**
          * 群成员在伙伴任务卡的话题里说的话，由伙伴转进这件任务（bot-group-chat.md §10）。
          * 标签与 `[消息来源]` 都写出是谁、在哪个群；此时没有来源任务（senderSessionId 为空）。

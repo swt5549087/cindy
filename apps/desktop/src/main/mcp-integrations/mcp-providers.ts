@@ -119,6 +119,7 @@ import { readLspModeSettings } from '../maker-host/lsp-mode-store.js';
 import {
   tryGetBotDirectMessageService,
   tryGetOrcaCollabService,
+  trackTaskDispatchReply,
   isSessionInTurn,
   getTaskActionInputState,
   isActiveInputAccountScoped,
@@ -1043,7 +1044,8 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         cancelQueuedMessage: wrap((service, params) => service.cancelSessionQueuedMessage(params)),
         steerQueuedMessage: wrap((service, params) => service.steerSessionQueuedMessage(params)),
         moveQueuedMessage: wrap((service, params) => service.moveSessionQueuedMessage(params)),
-        steerSession: wrap((service, params) => service.steerSession(params)),
+        steerSession: wrap((service, params) => trackTaskDispatchReply(
+          params.callerSessionId, params.targetSessionId, () => service.steerSession(params))),
         stopSessionTurn: wrap((service, params) => service.stopSessionTurn(params)),
         getSessionRuntime: wrap((service, params) => service.getSessionRuntime(params)),
         setSessionRuntime: wrap((service, params) => service.setSessionRuntime(params)),
@@ -1177,9 +1179,10 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
       ...(remoteSessionHandoff
         ? {
             sendToRemoteSession: async ({ deviceId, sessionId, message, dispatcherSessionId }) => {
-              const result = await remoteSessionHandoff({ deviceId, sessionId }, {
-                message, sender: () => remoteHandoffSender(dispatcherSessionId),
-              });
+              const result = await trackTaskDispatchReply(dispatcherSessionId, `${deviceId}::${sessionId}`,
+                () => remoteSessionHandoff({ deviceId, sessionId }, {
+                  message, sender: () => remoteHandoffSender(dispatcherSessionId),
+                }));
               if (!result.ok) return result;
               if (result.wakeKind === 'created') return { ok: false, errorCode: 'DELIVERY_UNKNOWN', message: 'Unexpected creation receipt for an existing task.' };
               return { ...result, wakeKind: result.wakeKind };
@@ -1253,7 +1256,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
             || effort !== undefined
             || fast !== undefined;
           const recordCreation = targetSessionId ? null : await captureBotCreatedTaskResponsibility(dispatcherSessionId);
-          const result = await svc.sendToSession({
+          const send = () => svc.sendToSession({
             targetSessionId,
             message,
             dispatcherSessionId,
@@ -1273,6 +1276,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
               : {}),
             ...(agentDeviceId !== undefined ? { agentDeviceId } : {}),
           });
+          const result = await (targetSessionId ? trackTaskDispatchReply(dispatcherSessionId, targetSessionId, send) : send());
           if (result.ok && result.wakeKind === 'created' && dispatcherSessionId)
             reportGroupTaskCreated(dispatcherSessionId, { taskId: result.targetSessionId, deviceId: null,
               title: result.targetTitle || title?.trim() || normalizeAutoTitle(message) });

@@ -5,6 +5,7 @@ import { isBotGroupInTaskClientId } from '../../../shared/botGroupChat.js';
 import { isShadowedCompanionSession } from '../botSessionInputGuard.js';
 import { createScheduledModelScope } from '../scheduledModelSelection.js';
 import { assertTaskActionCurrent, hasTaskActionAuthorization } from '../taskActionAuthorization.js';
+import { taskDispatchClientId } from '../taskDispatchReceipt.js';
 /**
  * #5788:插件 errand 派活走 sendToSessionInternal 的 lazy-resume 时,必须按会话落库的
  * 权限档恢复,不能落到 main 侧通路的缺省 bypass。否则插件任务被提权,errand 复用判定也会
@@ -250,6 +251,7 @@ function botTaskDispatchHarness(
     eq: noop,
     log: { info: noop, warn: noop, debug: noop, error: noop },
     createId: () => 'generated-client-id',
+    taskDispatchClientId,
     permissionModeOrAsk,
     readSenderIdentity: async () => ({}),
     sessionQueueOriginForDispatcher: noop,
@@ -633,6 +635,29 @@ it.each([
 // Existing cold-start tests omitted the receipt. Execute the actual production dispatch closure
 // for both idle branches; guard tier because register.ts has no separately exported entry.
 describe('idle forwarded request authorization', () => {
+  // Regression in the production create closure: a plain Agent request used
+  // to bypass the input coordinator, leaving the first turn without a parent.
+  it('binds a new task to the exact dispatcher before the first queued turn', async () => {
+    const row = { id: 'new-child', permissionMode: 'auto', planModeEnabled: false };
+    const enqueue = vi.fn(async () => {});
+    const h = botTaskDispatchHarness({ 'new-child': row }, {}, {
+      openSession: async (_input: unknown, create: (row: object, guard: () => Promise<void>) => Promise<unknown>) =>
+        ({ row, value: await create(row, async () => {}) }),
+      sessionQueueOriginForDispatcher: () => ({ kind: 'session', senderSessionId: 'dispatcher', displayText: 'Do work' }),
+      enqueueSendToSessionMessage: enqueue,
+      broadcastSessionCreated: vi.fn(),
+    });
+    expect(await h.sendToSessionInternal({ dispatcherSessionId: 'dispatcher', message: 'Do work',
+      taskDispatch: true })).toMatchObject({ ok: true, wakeKind: 'created', targetSessionId: 'new-child' });
+    expect(enqueue).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      targetSessionId: 'new-child',
+      clientId: 'task-dispatch:new-child',
+      origin: { kind: 'session', senderSessionId: 'dispatcher', displayText: 'Do work', taskDispatch: true,
+        dispatchedChildSessionId: 'new-child' },
+    }));
+    expect(h.sendOptions).toHaveLength(0);
+  });
+
   // 2026-10-27 / unit: a new recipient must accept the same durable provenance as
   // an existing one; direct send previously left its next handoff without a source.
   it('queues the first verified request of a newly created task', async () => {

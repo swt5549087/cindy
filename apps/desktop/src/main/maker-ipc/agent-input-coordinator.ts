@@ -1460,6 +1460,13 @@ export class AgentInputCoordinator {
     return active.latestSteeringClientId ?? active.item?.clientId ?? null;
   }
 
+  /** Actual input of this turn, excluding a turn taken over by steering. */
+  getActiveTaskDispatchInput(sessionId: string, vendorGeneration?: number): Readonly<AgentInputQueuedMessage> | undefined {
+    const item = this.states.get(sessionId)?.activeTurn?.item;
+    if (item?.origin?.kind !== 'session' || this.getActiveInputClientId(sessionId, vendorGeneration) !== item.clientId) return;
+    return item;
+  }
+
   /** Only a main-owned accepted receipt can silence this turn. Human steering restores visibility. */
   isActiveTaskCoordination(sessionId: string, vendorGeneration?: number): boolean {
     const active = this.states.get(sessionId)?.activeTurn;

@@ -90,6 +90,7 @@ import { encodeHistoryViewDelta } from '../../device-link/historyViewDelta';
 import { isScopedPeer, parseHistoryViewDeltaOptions } from '@cindy/device-link';
 import { hasTaskChangeListener, publishTaskChange } from '../taskEvents.js';
 import { createMessageClearRecovery } from '../messageClearRecovery.js';
+import { stripTaskDispatchOrigin } from '../../maker-ipc/taskDispatchReceipt.js';
 import { markLatestAgentHandoffConsumedWithPorts } from '../agentHandoffPendingQueries.js';
 
 export { listMessagesForAgentHandoff } from '../agentHandoffHistory.js';
@@ -608,7 +609,10 @@ export function registerMessageIpc(
     }
 
     const ipcMeta = b.agentMeta ? { ...(b.agentMeta as Record<string, unknown>) } : null;
-    if (ipcMeta) delete ipcMeta.autoReviewUserText;
+    if (ipcMeta) {
+      delete ipcMeta.autoReviewUserText;
+      ipcMeta.origin = stripTaskDispatchOrigin(ipcMeta.origin);
+    }
     return createMessage(sid, {
       clientId: cid,
       role: b.role as MessageRole,
@@ -630,13 +634,20 @@ export function registerMessageIpc(
         throwIpcError('INVALID_PARAMS', 'agentMeta 必须是对象或 null');
       }
       const ipcMeta = agentMeta ? { ...(agentMeta as Record<string, unknown>) } : null;
-      if (ipcMeta) delete ipcMeta.autoReviewUserText;
+      if (ipcMeta) {
+        delete ipcMeta.autoReviewUserText;
+        ipcMeta.origin = stripTaskDispatchOrigin(ipcMeta.origin);
+      }
       const serialized = ipcMeta ? JSON.stringify(ipcMeta) : null;
       // Preserve Host-authored evidence atomically; the renderer may neither mint nor replace it.
-      await getDbClient().drizzle.update(messages).set({ agentMeta: sql`CASE
+      const withAuthoredText = sql`CASE
         WHEN json_valid(${messages.agentMeta}) AND json_type(${messages.agentMeta}, '$.autoReviewUserText') IN ('text', 'object')
         THEN json_set(${serialized ?? '{}'}, '$.autoReviewUserText', json_extract(${messages.agentMeta}, '$.autoReviewUserText'))
-        ELSE ${serialized} END` }).where(and(eq(messages.sessionId, sid), eq(messages.clientId, cid)));
+        ELSE ${serialized} END`;
+      await getDbClient().drizzle.update(messages).set({ agentMeta: sql`CASE
+        WHEN json_valid(${messages.agentMeta}) AND json_type(${messages.agentMeta}, '$.origin.dispatchedChildSessionId') = 'text'
+        THEN json_set(coalesce(${withAuthoredText}, '{}'), '$.origin', json_extract(${messages.agentMeta}, '$.origin'))
+        ELSE ${withAuthoredText} END` }).where(and(eq(messages.sessionId, sid), eq(messages.clientId, cid)));
     },
   );
 

@@ -350,6 +350,30 @@ describe('local-db:messages:list cursor', () => {
     sqlite.close();
   });
 
+  // Unit with the real metadata handler and SQLite: a legacy AgentMeta PATCH
+  // can replace the JSON document while the initial task binding must survive.
+  it('keeps the dispatch parent across old metadata writes and strips forged bindings', async () => {
+    const sqlite = createDb();
+    try {
+      const origin = { kind: 'session', senderSessionId: 'parent', displayText: 'Work',
+        taskDispatch: true, dispatchedChildSessionId: 's1' };
+      insertCostMessage(sqlite, { id: 'first-dispatch', role: 'user', createdAt: 1, agentMeta: { origin } });
+      insertCostMessage(sqlite, { id: 'manual', role: 'user', createdAt: 2 });
+      registerMessageIpc();
+      const update = h.handlers.get('local-db:messages:updateAgentMeta')!;
+      const read = (id: string) => {
+        const row = sqlite.prepare('SELECT agent_meta FROM messages WHERE id = ?').get(id) as { agent_meta: string };
+        return JSON.parse(row.agent_meta);
+      };
+      await update({}, 's1', 'first-dispatch', { uuid: 'native-anchor' });
+      expect(read('first-dispatch')).toEqual({ origin, uuid: 'native-anchor' });
+      await update({}, 's1', 'manual', { origin });
+      expect(read('manual')).toEqual({ origin: { kind: 'session', senderSessionId: 'parent', displayText: 'Work' } });
+    } finally {
+      sqlite.close();
+    }
+  });
+
   it('atomically stores a Host answer and retains it across old renderer card PATCHes', async () => {
     const sqlite = createDb();
     try {

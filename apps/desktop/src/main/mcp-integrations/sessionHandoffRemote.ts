@@ -8,6 +8,7 @@ import {
   type InvokeResultPayload,
 } from '@cindy/device-link';
 import { issueRemoteTaskActionReceipt, releaseRemoteTaskActionReceipt } from '../maker-ipc/remoteTaskActionReceipt.js';
+import { TASK_STATUS_RECEIPT_OPERATION } from '../maker-ipc/taskDispatchReceipt.js';
 
 /**
  * send_to_session 的跨电脑发送端：把消息交给目标电脑，由它用本机 send_to_session 的
@@ -27,6 +28,7 @@ export interface RemoteSessionHandoffRequest {
   sender: { sessionId: string; title?: string } | { kind: 'plugin'; pluginId: string; name?: string };
   requestSource?: ForwardedRequestSource;
   taskActionReceipt?: string;
+  taskStatusReceipt?: true;
 }
 
 export type RemoteSessionHandoffResult =
@@ -147,6 +149,8 @@ export function createRemoteSessionHandoff(deps: {
       /** 在账号记录之后读取，使来源查询也落在同一道 owner 检查之内。 */
       sender(): Promise<RemoteSessionHandoffRequest['sender']>;
       create?(): Promise<RemoteSessionCreation>;
+      /** Host-generated summary without forwarded user authority. */
+      taskStatusReceipt?: true;
     },
   ): Promise<RemoteSessionHandoffResult> => {
     const notSent = (): RemoteSessionHandoffResult => ({
@@ -183,7 +187,9 @@ export function createRemoteSessionHandoff(deps: {
       }
     }
     try {
-      if ('sessionId' in sender) captured = await deps.captureRequest?.(sender.sessionId, request.message, { sessionId: target.sessionId });
+      if ('sessionId' in sender && !request.taskStatusReceipt) {
+        captured = await deps.captureRequest?.(sender.sessionId, request.message, { sessionId: target.sessionId });
+      }
       assertCurrent();
     } catch {
       return notSent();
@@ -214,12 +220,14 @@ export function createRemoteSessionHandoff(deps: {
       if (!support.ok) return capabilityProbeFailure(support.error.code, support.error.message);
       const capability = support.result as {
         taskActionVersion?: unknown; plainRequestBody?: unknown; ordinaryCreateVersion?: unknown;
-        ordinaryCreateAutoTitle?: unknown; pluginCaller?: unknown;
+        ordinaryCreateAutoTitle?: unknown; pluginCaller?: unknown; taskStatusReceipt?: unknown;
       } | null;
       if (capability?.taskActionVersion !== 1)
         return { ok: false, errorCode: 'REMOTE_UNSUPPORTED', message: 'The other computer must support task-action authorization before a message can be sent.' };
       if (creation && capability.ordinaryCreateVersion !== 1)
         return { ok: false, errorCode: 'REMOTE_UNSUPPORTED', message: 'Update the destination computer to support ordinary task creation. No task was created.' };
+      if (request.taskStatusReceipt && capability.taskStatusReceipt !== 1)
+        return { ok: false, errorCode: 'REMOTE_UNSUPPORTED', message: 'The other computer does not accept automatic task status receipts.' };
       if ('pluginId' in sender && capability.pluginCaller !== 1)
         return { ok: false, errorCode: 'REMOTE_UNSUPPORTED', message: 'The other computer does not support Plugin callers; no message was sent.' };
       assertCurrent();
@@ -233,10 +241,12 @@ export function createRemoteSessionHandoff(deps: {
       }
       taskActionReceipt = issueRemoteTaskActionReceipt({ ...target, ...('pluginId' in sender
         ? { senderPluginId: sender.pluginId } : { senderSessionId: sender.sessionId }), message: body,
-        ...(creation ? { operation: creationOperation(creation) } : {}) }, assertCurrent);
+        ...(creation ? { operation: creationOperation(creation) }
+          : request.taskStatusReceipt ? { operation: TASK_STATUS_RECEIPT_OPERATION } : {}) }, assertCurrent);
       const wire: RemoteSessionHandoffRequest = {
         sessionId: target.sessionId,
         ...(creation ? { action: 'create' as const, create: creation } : {}),
+        ...(request.taskStatusReceipt ? { taskStatusReceipt: true as const } : {}),
         message: body,
         // A plain body sends only a checked hand-off; its provenance stays on this computer.
         ...(source && (source.plainBody ? source.delegatedText !== undefined : source.userText != null)

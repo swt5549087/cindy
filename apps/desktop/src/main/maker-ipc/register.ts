@@ -1705,6 +1705,36 @@ import {
   type ProductTurnFailureOwner,
 } from './productTurnFailureOwner.js';
 import { installSessionTurnObserver } from './sessionTurnObserver.js';
+import { createTaskDispatchReceipts, readTaskDispatchParent, stripTaskDispatchOrigin, taskDispatchClientId, taskDispatchInput } from './taskDispatchReceipt.js';
+import { createRemoteSessionHandoff } from '../mcp-integrations/sessionHandoffRemote.js';
+
+let captureTaskDispatchReceiptAccess: Parameters<typeof createTaskDispatchReceipts>[0]['captureAccess'] | undefined;
+const taskDispatchReceipts = createTaskDispatchReceipts({
+  captureAccess: () => captureTaskDispatchReceiptAccess?.(),
+  warn: sessionId => log.warn('Task status receipt could not be delivered', { sessionId }),
+});
+
+export function trackTaskDispatchReply<T extends { ok: boolean }>(
+  callerId: string | undefined, targetId: string, send: () => Promise<T>,
+): Promise<T> {
+  if (!callerId) return send();
+  return taskDispatchReceipts.trackSend(callerId,
+    taskDispatchInput(agentInputCoordinatorHolder?.getActiveTaskDispatchInput(callerId)), targetId, send);
+}
+
+function captureTaskDispatchFinish(sessionId: string, generation?: number) {
+  return taskDispatchReceipts.capture(sessionId,
+    taskDispatchInput(agentInputCoordinatorHolder?.getActiveTaskDispatchInput(sessionId, generation)));
+}
+
+async function readFirstTaskDispatchInput(db: ReturnType<typeof getDbClient>['drizzle'], sessionId: string) {
+  // Read the creation input by its reserved ID, even if a user added input
+  // between remote creation and first dispatch. Do not scan normal history.
+  const [first] = await db.select({ agentMeta: messages.agentMeta })
+    .from(messages).where(and(eq(messages.sessionId, sessionId), eq(messages.role, 'user'),
+      inArray(messages.clientId, [taskDispatchClientId(sessionId), taskDispatchClientId(sessionId, true)]))).limit(1);
+  return first;
+}
 
 const log = createLogger('maker-ipc');
 const workdirLog = createLogger('workdir-diagnostics');
@@ -5869,12 +5899,22 @@ async function settleSilentStopDone(
   runtime: NonNullable<ReturnType<Maker['getSession']>>,
   generation: number,
 ): Promise<void> {
+  const finishDispatch = captureTaskDispatchFinish(sessionId, generation);
   await settleSilentStopDoneWithPorts(sessionId, reason, turnLeaseId, runtime, generation, {
     silentStopTurnLeaseGate, sessionTurnLeaseTracker, finalizeTurnChangeSet, sessionListActivityTracker,
     productTurnWallClockTracker, productTurnUsageTargetTracker, sessionTurnActivityTracker, noteClaudeSessionTurnState,
     agentInputCoordinatorHolder, settlePendingCredentialSwitch, settlePendingSessionRuntimeControlHolder,
     deferredCodexRestartHolder, gatewayCodexRestartHolder, refreshRemoteCodexMcpOnTurnSettledHolder,
-    fireSilentStopSettled, log,
+    fireSilentStopSettled: (id, status) => {
+      void finishDispatch?.({
+        status: 'blocked',
+        text: status === 'skip' ? 'The provider stopped without a final answer.'
+          : status === 'exhausted' ? 'The automatic continuation limit was reached.'
+            : 'The automatic continuation could not be sent.',
+      });
+      fireSilentStopSettled(id, status);
+    },
+    log,
   });
 }
 
@@ -5986,6 +6026,12 @@ const sessionBindings = createSessionBindingLifecycle<WiredSession, WiredSession
     const provenance = agentInputCoordinatorHolder?.getAcceptedInputProvenance(session.id);
     const groupInputId = inputId && provenance?.clientId === inputId && provenance.autoResume
       ? provenance.retrySourceClientId ?? inputId : inputId;
+    if ((context.closeReason === 'requested' || context.closeReason === 'unexpected')
+      && !context.preserveAutoResumeIntent && !rehydrateCloseSuppression.isSuppressed(session.id)
+      && !hasPendingProviderGroupContinuation(session.id)) {
+      void captureTaskDispatchFinish(session.id)?.({ status: 'interrupted', text: 'The task runtime closed before completing the turn.' });
+      taskDispatchReceipts.clear(session.id);
+    }
     void settleClosedBotGroupTurn(botGroupChatServiceHolder, session.id, groupInputId,
       context.preserveAutoResumeIntent || rehydrateCloseSuppression.isSuppressed(session.id) ||
       hasPendingProviderGroupContinuation(session.id)).catch(() =>
@@ -6089,6 +6135,7 @@ async function finishProductTurn(
     deferredProductTurnFailureGate.clear(owner);
     if (!isCurrentProductTurnFailureOwner(owner)) return;
   }
+  owner?.finishTaskDispatch?.();
   await finishUpstreamMergeTurn(sessionId);
 }
 
@@ -6098,7 +6145,8 @@ const interruptProductTurn = createProductTurnFailureFinalizer({
   commitActivity: (sessionId) => sessionListActivityTracker.commit(sessionId),
   settlePluginTasks: (sessionId, execution, inputClientIds) =>
     settlePluginTaskTerminal(sessionId, execution, 'failed', undefined, inputClientIds),
-  interrupt: async (sessionId) => {
+  interrupt: async (sessionId, owner) => {
+    owner?.finishTaskDispatch?.();
     await interruptUpstreamMergeTurn(sessionId);
   },
 });
@@ -6164,6 +6212,7 @@ const settlePluginTaskTerminal: NonNullable<SessionEventDependencies['onPluginTa
   };
 
 const sessionEventDependencies: SessionEventDependencies = {
+  captureTaskDispatchFinish,
   onPluginTaskTerminal: settlePluginTaskTerminal,
   onSuccessfulProductTurn: finishProductTurn,
   saveRemoteNativeHistory: (sessionId, data, anchor, persisted) =>
@@ -12142,6 +12191,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     inheritSourcePermissionMode?: boolean;
     /** Host-owned durable inputs use the coordinator even when idle. */
     forceQueue?: boolean;
+    /** Only the session handoff tool can establish a parent on local creation. */
+    taskDispatch?: boolean;
     /** Explicit target delivery preserves the recipient's current plan mode. */
     inheritTargetPlanMode?: boolean;
     /** 插件任务派发的来源(只用于标签与 `[消息来源]`,不是权限判据,也不是 origin)。 */
@@ -12175,12 +12226,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       createDefaults,
       inheritSourcePermissionMode,
     } = params;
-    const queuedOrigin = sessionQueueOriginForDispatcher({
+    const senderOrigin = sessionQueueOriginForDispatcher({
       dispatcherSessionId,
       ...(await readSenderIdentity(origin ? undefined : dispatcherSessionId)),
       message,
       explicitOrigin: origin,
     });
+    const queuedOrigin = params.taskDispatch && senderOrigin?.kind === 'session'
+      ? { ...senderOrigin, taskDispatch: true as const } : senderOrigin;
     const inputAgentMeta: AgentMeta | undefined = queuedOrigin || params.sourcePlugin || params.autoReviewUserText !== undefined
       ? {
           ...(queuedOrigin ? { origin: queuedOrigin } : {}),
@@ -12471,10 +12524,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             });
           }
         }
-        const clientId = createId();
+        const dispatchOrigin = queuedOrigin?.kind === 'session' && queuedOrigin.taskDispatch
+          ? { ...queuedOrigin, dispatchedChildSessionId: session.id } : undefined;
+        const clientId = dispatchOrigin ? taskDispatchClientId(session.id) : createId();
         createdPreviewSessionId = session.id;
         createdPreviewClientId = clientId;
-        if (verifiedOwnerRequestText(params.autoReviewUserText) !== undefined) {
+        if (dispatchOrigin || verifiedOwnerRequestText(params.autoReviewUserText) !== undefined) {
           // New tasks need the same accepted-input provenance as busy and idle
           // recipients, so further handoffs cannot lose the original request.
           const meta = await maker.getSessionMeta(session.id);
@@ -12482,7 +12537,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           if (!meta || !dbRow) throw new Error('Created session metadata unavailable');
           await enqueueSendToSessionMessage({ targetSessionId: session.id, message,
             persistedContent: persistedContent ?? message, clientId, meta, dbRow,
-            origin: queuedOrigin, sourcePlugin, autoReviewUserText: params.autoReviewUserText,
+            origin: dispatchOrigin ?? queuedOrigin, sourcePlugin, autoReviewUserText: params.autoReviewUserText,
             onAccepted: async () => { broadcastSessionCreated(session.id); },
             taskActionDeliveryGuard: params.taskActionDeliveryGuard,
           });
@@ -12649,8 +12704,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       if (params.files?.length || params.contextFiles?.length || params.forceQueue || verifiedOwnerRequestText(params.autoReviewUserText) !== undefined || explicitClientId?.startsWith('bot-dm:') || explicitClientId?.startsWith(BOT_GROUP_CLIENT_ID_PREFIX) || explicitClientId?.startsWith('bot-authorization-resume:') || inputCoordinator.shouldQueueNewTurn(targetSessionId) || agentSwitchPending.get(targetSessionId)) {
         lockStage = 'enqueue-queued-message';
         const qClientId = explicitClientId ?? createId();
-        const durableScriptDelivery = qClientId.startsWith('schedule-delivery:');
-        if (durableScriptDelivery) {
+        const durableHandoff = qClientId.startsWith('schedule-delivery:') ||
+          (queuedOrigin?.kind === 'session' && queuedOrigin.automaticTaskReceipt === true);
+        if (durableHandoff) {
           await inputCoordinator.ensureQueueRestored(targetSessionId);
           const persisted = await getPersistedInputClientIds(targetSessionId, [qClientId]);
           if (persisted.has(qClientId) || inputCoordinator.hasKnownClientId(targetSessionId, qClientId)) {
@@ -12682,7 +12738,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           inheritTargetPlanMode: params.inheritTargetPlanMode,
           taskActionDeliveryGuard: params.taskActionDeliveryGuard,
         });
-        if (durableScriptDelivery) await awaitAgentInputQueueSnapshotPersistence(targetSessionId);
+        if (durableHandoff) await awaitAgentInputQueueSnapshotPersistence(targetSessionId);
         return {
           ok: true as const,
           targetSessionId,
@@ -13246,8 +13302,75 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (!result.ok) throw new Error(`Input handoff continuation not accepted: ${result.errorCode}`);
   };
 
+  captureTaskDispatchReceiptAccess = () => {
+    const snapshot = getCurrentDbClientSnapshot();
+    if (!snapshot || isAppSessionBoundaryPending()) return;
+    const owner = captureDataOwnerBroadcastScope();
+    const assertCurrent = () => {
+      if (getCurrentDbClientSnapshot() !== snapshot || !isDataOwnerBroadcastScopeCurrent(owner)) {
+        throw new Error('Data owner changed before task status receipt');
+      }
+    };
+    return {
+      readTask: async (id, input, assistantId) => {
+        await drainPersistQueue();
+        assertCurrent();
+        const db = snapshot.client.drizzle;
+        const [row] = await db.select({ title: sessions.title, status: sessions.status })
+          .from(sessions).where(eq(sessions.id, id)).limit(1);
+        if (!row || row.status === 'deleted' || row.status === 'archived' || isSessionSharedTaskActive(id)) return;
+        const first = await readFirstTaskDispatchInput(db, id);
+        const parentSessionId = first ? readTaskDispatchParent(first.agentMeta, id)
+          : input.origin.dispatchedChildSessionId === id ? input.origin.senderSessionId : undefined;
+        if (parentSessionId !== input.origin.senderSessionId) return;
+        const [assistant] = assistantId ? await db.select({ content: messages.content })
+          .from(messages).where(and(eq(messages.sessionId, id), eq(messages.clientId, assistantId),
+            eq(messages.role, 'assistant'), isNull(messages.rewindAt))).limit(1) : [];
+        assertCurrent();
+        const deviceId = parentSessionId.includes('::') ? getSelfDeviceId() : undefined;
+        return {
+          title: row.title,
+          parentSessionId,
+          assistantText: extractPlainText(assistant?.content),
+          ...(deviceId ? { childAddress: `${deviceId}::${id}` } : {}),
+        };
+      },
+      deliver: receipt => runOutsideDeviceLinkInvokeContext(() => runTaskActionRequest(async () => {
+        const { childSessionId, parentSessionId, clientId, title, message } = receipt;
+        const assertDeliveryCurrent = () => {
+          assertCurrent();
+          if (isSessionSharedTaskActive(childSessionId) || isSessionSharedTaskActive(parentSessionId)) {
+            throw new Error('Task status receipts are unavailable in shared tasks');
+          }
+        };
+        assertDeliveryCurrent();
+        const separator = parentSessionId.indexOf('::');
+        const result = separator > 0
+          ? await createRemoteSessionHandoff({
+              captureAccess: () => assertDeliveryCurrent,
+              invoke: invokeBotPeer,
+            })({ deviceId: parentSessionId.slice(0, separator), sessionId: parentSessionId.slice(separator + 2) }, {
+              message, taskStatusReceipt: true, sender: async () => ({ sessionId: childSessionId, title: title ?? undefined }),
+            })
+          : await sendToSessionInternal({
+              targetSessionId: parentSessionId, clientId, message, forceQueue: true,
+              origin: { kind: 'session', senderSessionId: childSessionId, displayText: message,
+                senderSessionTitle: title ?? undefined, automaticTaskReceipt: true },
+              autoReviewUserText: { kind: 'agent-request' },
+              resumeWithStoredPermissionMode: true, inheritTargetPlanMode: true,
+              assertDispatchCurrent: assertDeliveryCurrent,
+              taskActionDeliveryGuard: async () => assertDeliveryCurrent(),
+            });
+        if (!result.ok && !['NOT_FOUND', 'ARCHIVED', 'DELETED', 'UNSUPPORTED_CAPABILITY', 'REMOTE_UNSUPPORTED'].includes(result.errorCode)) {
+          throw new Error('Task status receipt was not accepted');
+        }
+      })),
+    };
+  };
+
   // 同账号另一台电脑上的任务发来的消息（Agent 的 send_to_session 传 deviceId::sessionId）。
   registerSessionHandoffIpc({
+    canReceiveTaskStatusReceipt: id => !isSessionSharedTaskActive(id),
     refineTitle: (id, subject, initial) => { void refineCreatedTaskTitle(id, subject, { initialTitle: initial }); },
     listProjects: options => listProjects({ ...options, callerSessionId: undefined }),
     create: createRemoteSessionOpener({
@@ -17616,11 +17739,20 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         : await captureSessionAgentRequest(params.dispatcherSessionId ?? '', params.message,
           { sessionId: params.targetSessionId });
       params = { ...params, message: request.message };
+      const dispatcherId = params.dispatcherSessionId;
+      const taskDispatch = !!dispatcherId && !params[AUTO_REVIEW_DELEGATED_CONTINUATION] && !isSessionSharedTaskActive(dispatcherId);
+      let forceDispatchQueue = false;
+      if (taskDispatch && params.targetSessionId) {
+        const first = await readFirstTaskDispatchInput(getDbClient().drizzle, params.targetSessionId);
+        forceDispatchQueue = readTaskDispatchParent(first?.agentMeta ?? null, params.targetSessionId) === dispatcherId;
+      }
       if (!isDataOwnerBroadcastScopeCurrent(ownerScope)) {
         return { ok: false, errorCode: 'AGENT_NOT_READY', message: 'Data owner changed before delivery.' };
       }
       const sent = await sendToSessionInternal({
         ...params,
+        ...(taskDispatch ? { taskDispatch: true } : {}),
+        ...(forceDispatchQueue ? { forceQueue: true } : {}),
         ...(pluginSource ? { sourcePlugin: pluginSource, inheritTargetPlanMode: true, resumeWithStoredPermissionMode: true } : {}),
         ...(params.deliveryClientId ? { clientId: params.deliveryClientId } : {}),
         autoReviewUserText: pluginSource ? params.message : request.autoReviewUserText,
@@ -19975,6 +20107,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       publishUiSessionIntervention(sessionId);
     },
     onRejectedUserTurn: (sessionId, item) => {
+      void taskDispatchReceipts.capture(sessionId, taskDispatchInput(item))?.({
+        status: 'failed', text: inputCoordinator.getProjection(sessionId).error ?? undefined,
+      });
       void settleUndispatchedBotGroupTurn(botGroupChatServiceHolder, sessionId, item.clientId,
         'failed', inputCoordinator.getProjection(sessionId).error).catch(() => {
         log.warn('Bot group undispatched input settlement failed', { sessionId });
@@ -20498,6 +20633,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       throwIpcError('INVALID_PARAMS', 'queued.createOpts.agentKind invalid');
     }
     const normalized: AgentInputQueuedMessage = { ...msg };
+    normalized.origin = stripTaskDispatchOrigin(normalized.origin);
     if (normalized.origin?.kind === 'orca') {
       // 系统兜底合批标记只由 main 的 auto-bridge 入口盖章；wire 自报一律剥掉。
       const origin = { ...normalized.origin };

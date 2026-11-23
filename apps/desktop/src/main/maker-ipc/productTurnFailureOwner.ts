@@ -64,6 +64,8 @@ export interface ProductTurnFailureOwner {
   readonly originalExecution?: { readonly instanceId: string; readonly generation: number };
   /** Accepted plugin inputs captured before terminal handling advances the queue. */
   readonly pluginTargetInputIds?: string[];
+  /** Completion captured before the input coordinator advances to another turn. */
+  finishTaskDispatch?: () => void;
 }
 
 export function captureProductTurnFailureOwner(

@@ -7,6 +7,7 @@ import { captureTurnUsageContext, type TurnUsageContext } from './turnUsageConte
 import { contextSnapshotForStatus, isContextCompactionSnapshot } from './sessionContextSnapshot.js';
 import type { BotCompactRuntimeRefreshCoordinator } from './botCompactRuntimeRefresh.js';
 import type { AgentEvent, SendOrigin, Session } from '@cindy/maker-core';
+import type { FinishTaskDispatch } from './taskDispatchReceipt.js';
 
 import { isTurnContinuationBoundaryEvent } from '@cindy/maker-shared/turn-continuation';
 
@@ -62,6 +63,7 @@ import {
 } from './sessionEventPreparationSteps.js';
 
 export interface PrepareSessionEventDeps extends InteractionDismissedDeps {
+  readonly captureTaskDispatchFinish?: (sessionId: string, generation?: number) => FinishTaskDispatch | undefined;
   readonly sessionListActivityTracker: SessionListActivityTracker;
   readonly botCompactRuntimeRefreshCoordinator: Pick<BotCompactRuntimeRefreshCoordinator, 'noteBoundary'>;
   readonly isFencedStaleSessionTerminal: (sessionId: string, event: AgentEvent) => boolean;
@@ -180,6 +182,8 @@ export function prepareSessionEvent(
       .filter(id => taskResultClientIdForInput(id) !== null) : [];
   const activeInputId = event.turnScope === 'background' ? null
     : deps.agentInputCoordinatorHolder?.getActiveInputClientId(session.id, event.sessionTurnGeneration);
+  const finishTaskDispatch = activeInputId && (event.type === 'done' || isTerminalTurnErrorEvent(event))
+    ? deps.captureTaskDispatchFinish?.(session.id, event.sessionTurnGeneration) : undefined;
   const provenance = deps.agentInputCoordinatorHolder?.getAcceptedInputProvenance(session.id);
   // Capture ownership before onTurnEvent releases the accepted receipt. Automatic
   // retries keep the original group execution; human steering owns its own input.
@@ -463,6 +467,7 @@ export function prepareSessionEvent(
     attributedEvent,
     botTaskResultInputIds,
     pluginTargetInputIds,
+    finishTaskDispatch,
     groupLaneInputClientId,
     broadcastEvent,
     eventAgentMeta,

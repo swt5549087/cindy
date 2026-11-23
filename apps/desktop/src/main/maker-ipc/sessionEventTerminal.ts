@@ -280,6 +280,16 @@ export function finishSessionTerminalEvent(
           workerTerminalDoneData?.error?.message,
         ].find((value): value is string => typeof value === 'string' && value.trim().length > 0)
       : undefined;
+    const finishTaskDispatch = prepared.finishTaskDispatch;
+    if (terminalOwner && finishTaskDispatch && (event.data as { silentStop?: boolean } | null)?.silentStop !== true) {
+      const nativeStatus = (event.data as { status?: unknown } | null)?.status;
+      const status = nativeStatus === 'cancelled' || nativeStatus === 'interrupted' ? nativeStatus
+        : event.type === 'done' && !isTerminalTurnErrorEvent(event) && isSuccessfulAssistantReplyDoneData(event.data)
+          ? 'finished' : 'failed';
+      const text = workerTerminalDiagnostic ?? workerTerminalFinalText;
+      const assistantId = turnBoundaryAssistantPersistId ?? undefined;
+      terminalOwner.finishTaskDispatch = () => { void finishTaskDispatch({ status, text, assistantId }); };
+    }
     const groupTerminal: BotGroupLaneTerminal | null = deps.botGroupChatServiceHolder ? {
       sessionId: session.id,
       activeInputClientId: groupLaneInputClientId,

@@ -976,6 +976,29 @@ describe('production Session event pipeline', () => {
     },
   );
 
+  // Unit regression: the product terminal must retain the exact receipt even
+  // after queue advancement. A silent-stop segment is not a product finish.
+  it.each([
+    [{ status: 'completed', result: 'answer' }, 'finished'],
+    [{ status: 'interrupted' }, 'interrupted'],
+    [{ status: 'completed', silentStop: true }, null],
+  ] as const)('settles the captured dispatch receipt at the product boundary (%j)', async (data, status) => {
+    const h = harness();
+    const finish = vi.fn(async () => {});
+    h.deps.agentInputCoordinatorHolder.getActiveInputClientId.mockReturnValue('accepted-handoff');
+    const deps = h.dependencies;
+    handleSessionEvent({
+      ...deps,
+      captureTaskDispatchFinish: () => finish,
+      onSuccessfulProductTurn: async (_id, owner) => owner?.finishTaskDispatch?.(),
+      onUnsuccessfulProductTurn: async (_id, owner) => owner?.finishTaskDispatch?.(),
+    }, h.session, event('done', data, { sessionTurnGeneration: 0 }));
+    await microtasks();
+    if (status) expect(finish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status }));
+    else expect(finish).not.toHaveBeenCalled();
+    await h.dispose();
+  });
+
   // #6671 persisted product regression (unit): existing hold tests checked error
   // rows and Worker/group reports, but not plugin/upstream receipts. A terminal
   // capacity error with only a group hold must retain its real product owner;

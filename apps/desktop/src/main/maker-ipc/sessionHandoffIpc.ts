@@ -13,12 +13,13 @@ import { hasRemoteBotSessionLookup } from '../device-link/remoteBotSessionBounda
 import { requireObject, throwIpcError } from '../utils/ipcValidate.js';
 import type { TaskActionDeliveryGuard } from './taskActionAuthorization.js';
 import { validateRemoteTaskActionReceipt } from './remoteTaskActionReceipt.js';
+import { TASK_STATUS_RECEIPT_OPERATION, taskDispatchClientId } from './taskDispatchReceipt.js';
 
 /**
  * `maker:session:handoff` 的被控端业务体：同账号另一台电脑上的任务，把一条消息发给
  * 本机的普通任务（可显式创建）。投递复用本机 send_to_session 的同一条通路（恢复、繁忙排队、落库）。
  *
- * - 不带 action 只投递既有任务；action=create 创建普通任务，不建立 Worker 或回传编排。
+ * - 不带 action 只投递既有任务；action=create 创建普通任务并标记首条输入的发起会话。
  * - 来源只用于归属展示，不是权限判据：发送方任务 id 加上**服务端认证的控制端设备 id**
  *   前缀（`deviceId::sessionId`，接收方可原样用它回信）；标题来自对端，按不可信文本清洗。
  * - 恢复不在运行的目标任务时按它落库的权限档启动，另一台电脑的来信不提权。
@@ -60,6 +61,7 @@ export function createSessionHandoffHandler(deps: {
   create?: ReturnType<typeof createRemoteSessionOpener>;
   refineTitle?(sessionId: string, subject: string, initialTitle: string): void;
   listProjects?(options: { includeHidden: boolean; offset: number; limit: number }): Promise<unknown>;
+  canReceiveTaskStatusReceipt?(target: string): boolean;
   validate?(controllerDeviceId: string, input: { receiptId: string; sessionId?: string; pluginId?: string; targetSessionId: string; message: string; release?: boolean; operation?: string }): Promise<boolean>;
 }) {
   // Claim before the first await. The sender receipt expires after one hour; retain
@@ -72,7 +74,10 @@ export function createSessionHandoffHandler(deps: {
     if (request.action !== undefined && request.action !== 'create') throwIpcError('INVALID_PARAMS', 'Unknown handoff action');
     if (creation && (!deps.create || !z.uuid().safeParse(targetSessionId).success))
       return { ok: false, errorCode: 'INVALID_ARGS', message: 'Remote creation requires a new UUID and a supported host.' };
-    const operation = creation ? creationOperation(creation) : undefined;
+    const automaticReceipt = request.taskStatusReceipt === true;
+    if (request.taskStatusReceipt !== undefined && (!automaticReceipt || creation || request.requestSource !== undefined))
+      throwIpcError('INVALID_PARAMS', 'Invalid automatic task status receipt');
+    const operation = creation ? creationOperation(creation) : automaticReceipt ? TASK_STATUS_RECEIPT_OPERATION : undefined;
     // 目标必须是本机任务；带设备前缀的 id 属于别的电脑，不代为转发。
     if (targetSessionId.includes('::'))
       throwIpcError('INVALID_PARAMS', 'Handoff cannot forward to another device');
@@ -88,7 +93,7 @@ export function createSessionHandoffHandler(deps: {
     const senderPluginId = plugin ? boundedString(sender.pluginId, 'sender.pluginId', 512) : undefined;
     const senderSessionId = plugin ? undefined : boundedString(sender.sessionId, 'sender.sessionId', 512);
     const actorId = senderPluginId ?? senderSessionId!;
-    if (actorId.includes('::') || /[\s()「」]/.test(actorId) || (plugin && (sender.sessionId !== undefined || request.requestSource !== undefined))) {
+    if (actorId.includes('::') || /[\s()「」]/.test(actorId) || (plugin && (sender.sessionId !== undefined || request.requestSource !== undefined || automaticReceipt))) {
       throwIpcError('INVALID_PARAMS', 'Invalid sender.sessionId');
     }
     const senderSessionTitle = sanitizeSourceName(sender.title);
@@ -97,6 +102,9 @@ export function createSessionHandoffHandler(deps: {
     if (typeof request.taskActionReceipt !== 'string' || !deps.validate) {
       return { ok: false, errorCode: 'UNSUPPORTED_CAPABILITY', message: 'Task action authorization is required; update the sending computer.' };
     }
+    if (automaticReceipt && deps.canReceiveTaskStatusReceipt?.(targetSessionId) !== true) {
+      return { ok: false, errorCode: 'UNSUPPORTED_CAPABILITY', message: 'The task does not accept automatic status receipts.' };
+    }
     const receiptId = boundedString(request.taskActionReceipt, 'taskActionReceipt', 128);
     for (const [key, expires] of claimed) if (expires <= Date.now()) claimed.delete(key);
     const claimKey = JSON.stringify([controllerDeviceId, receiptId]);
@@ -104,6 +112,8 @@ export function createSessionHandoffHandler(deps: {
       return { ok: false, errorCode: creation ? 'DELIVERY_UNKNOWN' : 'UNSUPPORTED_CAPABILITY', message: 'Task action already claimed or pending limit reached; inspect the target before retrying.' };
     claimed.set(claimKey, Date.now() + 2 * 60 * 60_000);
     const taskActionDeliveryGuard: TaskActionDeliveryGuard = async () => {
+      if (automaticReceipt && deps.canReceiveTaskStatusReceipt?.(targetSessionId) !== true)
+        throw new Error('TASK_STATUS_RECEIPT_UNAVAILABLE');
       if (!await deps.validate!(controllerDeviceId, { receiptId, ...actor, targetSessionId, message: body, ...(operation ? { operation } : {}) }))
         throw new Error('TASK_ACTION_AUTHORIZATION_EXPIRED');
     };
@@ -129,16 +139,19 @@ export function createSessionHandoffHandler(deps: {
     }
     const result = await deps.send({
       autoReviewUserText: plugin ? body : { kind: 'agent-request', request: requestSource ?? { userText: null } },
-      clientId: `remote-task-action:${receiptId}`,
+      clientId: created && !plugin ? taskDispatchClientId(targetSessionId, true) : `remote-task-action:${receiptId}`,
       forceQueue: true,
       taskActionDeliveryGuard,
       targetSessionId,
       message,
+      ...(automaticReceipt ? { inheritTargetPlanMode: true as const } : {}),
       ...(plugin ? { inheritTargetPlanMode: true as const, sourcePlugin: { pluginId: `${controllerDeviceId}::${senderPluginId}`,
         ...(senderPluginName ? { name: senderPluginName } : {}) } } : { origin: {
         kind: 'session',
+        ...(automaticReceipt ? { automaticTaskReceipt: true } : { taskDispatch: true }),
         senderSessionId: `${controllerDeviceId}::${senderSessionId}`,
         displayText: message,
+        ...(created ? { dispatchedChildSessionId: targetSessionId } : {}),
         ...(senderSessionTitle ? { senderSessionTitle } : {}),
       } as NonNullable<AgentInputQueuedMessage['origin']> }),
       resumeWithStoredPermissionMode: true,
@@ -186,6 +199,7 @@ export function registerSessionHandoffIpc(
       ...(deps.create ? { ordinaryCreateVersion: 1 } : {}),
       ...(deps.create && deps.refineTitle ? { ordinaryCreateAutoTitle: 1 } : {}),
       ...(deps.listProjects ? { projectCatalogVersion: 1 } : {}),
+      ...(deps.canReceiveTaskStatusReceipt ? { taskStatusReceipt: 1 } : {}),
     };
     if (request.action === 'list-projects') {
       if (!deps.listProjects) throwIpcError('UNSUPPORTED_CAPABILITY', 'Project catalog is unavailable');
