@@ -760,6 +760,7 @@ export async function listBotDmThreads(botId: string, rootSessionId: string): Pr
  * release their live runtimes.
  */
 export async function archiveBotChannelLanes(input: {
+  botId?: string;
   routeKey?: string;
   routeKeyPrefix?: string;
   exceptBotId?: string | null;
@@ -767,6 +768,7 @@ export async function archiveBotChannelLanes(input: {
   const owner = captureBotOperationOwner();
   const result = await getDbClient().tx<{ archivedSessionIds: string[] }>('bots.archiveChannelLanes', {
     routeKey: input.routeKey ?? null,
+    botId: input.botId,
     routeKeyPrefix: input.routeKeyPrefix ?? null,
     exceptBotId: input.exceptBotId ?? null,
     now: Date.now(),
@@ -864,12 +866,14 @@ export async function reconcileBotProfileFolder(
   return derived;
 }
 
-function botSessionAgentKind(config: { harness?: unknown }): 'cc' | 'codex' | 'pi' | 'antigravity' {
-  return config.harness === 'codex' || config.harness === 'pi' || config.harness === 'antigravity' ? config.harness : 'cc';
+function botSessionAgentKind(config: { harness?: unknown }): 'cc' | 'codex' | 'pi' | 'acp' | 'antigravity' {
+  return config.harness === 'codex' || config.harness === 'pi' || config.harness === 'acp'
+    || config.harness === 'antigravity' ? config.harness : 'cc';
 }
 
 function defaultBotModelForConfig(config: Record<string, unknown>): string {
-  return botSessionAgentKind(config) === 'pi' ? NEW_BOT_DEFAULT_PI_MODEL : 'claude-sonnet-4-6';
+  const kind = botSessionAgentKind(config);
+  return kind === 'pi' ? NEW_BOT_DEFAULT_PI_MODEL : kind === 'acp' ? 'default' : 'claude-sonnet-4-6';
 }
 
 function botSessionPermissionMode(config: Record<string, unknown>): 'ask' | 'auto' | 'bypassPermissions' {
@@ -880,10 +884,11 @@ type BotPrimaryRoute = Awaited<ReturnType<typeof readEffectiveBotModelChain>>[nu
 
 /** Session runtime fields every Bot-owned Chat (canonical or group lane) starts from. */
 function botSessionRouteFields(config: Record<string, unknown>, primaryRoute: BotPrimaryRoute | null) {
+  const agentKind = botSessionAgentKind(primaryRoute ?? config);
   return {
     model:
       primaryRoute?.model ??
-      (typeof config.model === 'string'
+      (typeof config.model === 'string' && config.model.trim()
         ? config.model.trim()
         : defaultBotModelForConfig(config)),
     providerId:
@@ -892,19 +897,19 @@ function botSessionRouteFields(config: Record<string, unknown>, primaryRoute: Bo
         ? config.providerId.trim()
         : config.providerId === null
           ? null
-          : botSessionAgentKind(primaryRoute ?? config) === 'pi'
+          : agentKind === 'pi'
             ? NEW_BOT_DEFAULT_PI_PROVIDER
             : undefined),
     effort:
       primaryRoute?.effort ||
       (typeof config.effort === 'string' && config.effort.trim()
         ? config.effort.trim()
-        : botSessionAgentKind(primaryRoute ?? config) === 'pi'
+        : agentKind === 'pi'
           ? NEW_BOT_DEFAULT_PI_EFFORT
           : undefined),
-    fastMode: primaryRoute?.fastMode ?? config.fastMode === true,
+    fastMode: agentKind === 'acp' ? false : (primaryRoute?.fastMode ?? config.fastMode === true),
     agentDeviceId: primaryRoute?.agentDeviceId ?? null,
-    agentKind: botSessionAgentKind(primaryRoute ?? config),
+    agentKind,
     permissionMode: botSessionPermissionMode(config),
   };
 }
@@ -1280,7 +1285,7 @@ async function readProfile(
       fastMode: primaryModelRoute?.fastMode ?? config.fastMode === true,
       harness:
         primaryModelRoute?.harness ??
-        (config.harness === 'codex' || config.harness === 'pi' || config.harness === 'antigravity' ? config.harness : 'claude'),
+        (config.harness === 'codex' || config.harness === 'pi' || config.harness === 'acp' || config.harness === 'antigravity' ? config.harness : 'claude'),
       modelChain,
       modelChainOverride: Array.isArray(config.modelChainOverride)
         ? normalizeBotModelChain(config.modelChainOverride)
