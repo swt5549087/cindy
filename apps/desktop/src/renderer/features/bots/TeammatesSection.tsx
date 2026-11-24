@@ -78,7 +78,6 @@ import {
 } from './botListDisplay';
 import { botDeviceLabel, partitionBotRoster } from './botRosterDisplay';
 import { readCollapsedTeammateAvatars, writeCollapsedTeammateAvatars, readTeammatesViewMode, writeTeammatesViewMode, type TeammatesViewMode, readTeammatesSectionCollapsed, writeTeammatesSectionCollapsed } from './teammatesSectionPrefs';
-import { toast } from '@/lib/toast';
 import {
   BotModelSelectionRequiredError,
   canonicalBotSessionId,

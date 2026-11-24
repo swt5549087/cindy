@@ -1,4 +1,5 @@
 import { createMakerSteerTransaction } from '../makerSteerTransaction.js';
+import { REMOTE_STEER_PROVIDER_GUARD } from '../taskActionAuthorization.js';
 import { createWireNoteMemory } from '../wireNoteMemory.js';
 import { DEFAULT_CLASSICAL_REPLY_STYLE } from '@cindy/maker-shared/classical-reply';
 import { readMessageSourcePlugin, readMessageSourcePluginRelay, sanitizeSourceName } from '@cindy/maker-shared/message-source';
@@ -114,7 +115,7 @@ it.each([false, true])('preserves target scope through accepted delivery (delega
 // Exercise the shared production transaction instead of compiling its old location.
 function sharedSteer(steer: (content: never, options: SendOptions & { beforeProviderStart?: () => Promise<void> }) => Promise<void>, context?: {
   text: string; assertCurrent(): Promise<void>; consume(): void;
-}) {
+}, publishUiSessionIntervention = () => {}) {
   const session = { steer, agentKind: 'codex', capabilities: { sameTurnSteer: { supported: true } },
     isTurnRunning: () => true, getTurnGeneration: () => 1 };
   return createMakerSteerTransaction({
@@ -127,9 +128,36 @@ function sharedSteer(steer: (content: never, options: SendOptions & { beforeProv
     wireNoteMemory: createWireNoteMemory(), inputHandoffSteerNote: () => null,
     inputHandoffNoteDelivered: () => {}, mcpAppModelContext: async () => context
       ?? { text: '', assertCurrent: async () => {}, consume() {} },
-    publishUiSessionIntervention: () => {}, log: { info() {}, warn() {}, debug() {} },
+    publishUiSessionIntervention, log: { info() {}, warn() {}, debug() {} },
   });
 }
+
+// Unit/transaction: steer has both preparation and a provider boundary.
+// A single-use remote receipt must be consumed once, at the latter boundary.
+it.each([true, false])('applies a remote steer only after final authorization (%s)', async authorized => {
+  const injected = vi.fn();
+  const publish = vi.fn();
+  const consume = vi.fn(async () => {
+    if (!authorized) throw new Error('AUTHORIZATION_EXPIRED');
+  });
+  const steer: Parameters<typeof sharedSteer>[0] = async (_message, options) => {
+    expect(consume).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    await options.beforeProviderStart?.();
+    injected();
+  };
+  const result = sharedSteer(steer, undefined, publish)('task', 'urgent', { [REMOTE_STEER_PROVIDER_GUARD]: consume });
+  if (authorized) {
+    await result;
+    expect(publish).toHaveBeenCalledOnce();
+    expect(injected).toHaveBeenCalledOnce();
+  } else {
+    await expect(result).rejects.toThrow('AUTHORIZATION_EXPIRED');
+    expect(publish).not.toHaveBeenCalled();
+    expect(injected).not.toHaveBeenCalled();
+  }
+  expect(consume).toHaveBeenCalledOnce();
+});
 
 it.each(['Do not publish.', '', undefined])('keeps live authority through the final delegated steer boundary: %j', async previous => {
   const invoke = async (delegated: boolean) => {
@@ -439,11 +467,12 @@ it('routes trusted script follow-ups through durable authorization restoration, 
   const send = new Function(
     'captureDataOwnerBroadcastScope', 'classifySessionMessagePurpose', 'isDataOwnerBroadcastScopeCurrent',
     'sendToSessionInternal', 'AUTO_REVIEW_DELEGATED_CONTINUATION', 'coordinationInput', 'captureSessionAgentRequest',
-    'resolveSessionProject',
+    'resolveSessionProject', 'isSessionSharedTaskActive', 'getDbClient', 'readFirstTaskDispatchInput', 'readTaskDispatchParent',
     compile(`return ({ ${source.slice(start, end)} }).sendToSession;`),
   )(() => 'owner', async () => ({ coordination: null, delegatedContinuation: false }), () => true,
     sendToSessionInternal, AUTO_REVIEW_DELEGATED_CONTINUATION, () => { throw new Error('not coordination'); },
-    capture, async () => ({ ok: true, projectDir: '/project' }));
+    capture, async () => ({ ok: true, projectDir: '/project' }),
+    () => false, () => ({ drizzle: {} }), async () => null, () => null);
   const params = { dispatcherSessionId: 'caller', targetSessionId: 'task', message: 'CI failed; repair and push the PR' };
   expect(await send({ ...params, [AUTO_REVIEW_DELEGATED_CONTINUATION]: true })).toMatchObject({
     message: params.message,

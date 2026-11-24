@@ -1,4 +1,5 @@
 import { normalizeAutoTitle } from '@cindy/maker-shared/session-title';
+import { z } from 'zod';
 import { creationOperation, remoteSessionCreationSchema, type RemoteSessionCreation, type RemoteSessionCreated } from '../../shared/remoteSessionCreation.js';
 import type { CapturedAgentRequest } from '../maker-ipc/forwardedRequest.js';
 import type { ForwardedRequestSource } from '../../shared/forwardedRequest.js';
@@ -7,7 +8,7 @@ import {
   DL_SESSION_HANDOFF_CHANNEL,
   type InvokeResultPayload,
 } from '@cindy/device-link';
-import { issueRemoteTaskActionReceipt, releaseRemoteTaskActionReceipt } from '../maker-ipc/remoteTaskActionReceipt.js';
+import { issueRemoteTaskActionReceipt, releaseRemoteTaskActionReceipt, STOP_TURN_RECEIPT_BODY } from '../maker-ipc/remoteTaskActionReceipt.js';
 import { TASK_STATUS_RECEIPT_OPERATION } from '../maker-ipc/taskDispatchReceipt.js';
 
 /**
@@ -132,15 +133,86 @@ function transportFailure(
   }
 }
 
-export function createRemoteSessionHandoff(deps: {
-  captureRequest?: (sessionId: string, supplement: string, target?: { sessionId?: string }) => Promise<CapturedAgentRequest>;
+interface RemoteHandoffTransport {
   captureAccess(): () => void;
-  invoke(
-    deviceId: string,
-    channel: string,
-    args: unknown[],
-    options?: { preSend?: () => void },
-  ): Promise<InvokeResultPayload>;
+  invoke(deviceId: string, channel: string, args: unknown[], options?: { preSend?: () => void }): Promise<InvokeResultPayload>;
+}
+
+const turnFailure = z.object({
+  ok: z.literal(false),
+  errorCode: z.enum(['NOT_FOUND', 'NO_ACTIVE_TURN', 'UNSUPPORTED_CAPABILITY', 'DELIVERY_FAILED']),
+  message: z.string(),
+});
+const steerReply = z.union([turnFailure, z.object({ ok: z.literal(true), queuedMessageId: z.string().min(1) })]);
+const stopReply = z.union([turnFailure.omit({ errorCode: true }).extend({ errorCode: z.enum(['NOT_FOUND', 'UNSUPPORTED_CAPABILITY']) }),
+  z.object({
+    ok: z.literal(true),
+    status: z.enum(['no-active-turn', 'waiting-for-safe-point', 'requested', 'unconfirmed']),
+    turnGeneration: z.number().int().nonnegative().optional(),
+    reason: z.string().optional(),
+  })]);
+
+export function createRemoteSessionTurnControl(deps: RemoteHandoffTransport) {
+  async function invokeTurn<T>(
+    targetId: string, sender: () => Promise<{ sessionId: string; title?: string } | null>,
+    action: 'steer' | 'stop-turn', message: string, schema: z.ZodType<T>,
+  ) {
+    const separator = targetId.indexOf('::');
+    const target = { deviceId: targetId.slice(0, separator), sessionId: targetId.slice(separator + 2) };
+    if (separator <= 0 || !target.sessionId || target.sessionId.includes('::') || target.sessionId.length > 512
+      || !message.trim() || message.length > 200_000) {
+      return { ok: false as const, errorCode: 'INVALID_ARGS' as const, message: 'Invalid remote task or message.' };
+    }
+    const unavailable = { ok: false as const, errorCode: 'REMOTE_UNAVAILABLE' as const,
+      message: 'Could not check the target computer. No turn control request was sent.' };
+    const unsupported = { ok: false as const, errorCode: 'UNSUPPORTED_CAPABILITY' as const,
+      message: 'Update the target computer to use cross-computer turn control.' };
+    const unknown = { ok: false as const, errorCode: 'DELIVERY_UNKNOWN' as const,
+      message: 'Could not confirm the action. Check the current task state before retrying.' };
+    const probeFailure = (code: string, message: string) => {
+      const { errorCode } = transportFailure(code, message);
+      return errorCode === 'REMOTE_UNSUPPORTED' || errorCode === 'INVALID_ARGS' ? unsupported : unavailable;
+    };
+    let receiptId: string | undefined;
+    try {
+      const assertCurrent = deps.captureAccess();
+      const actor = await sender();
+      if (!actor) return { ...unsupported, message: 'Cross-computer turn control requires a sending task.' };
+      const support = await deps.invoke(target.deviceId, DL_SESSION_HANDOFF_CHANNEL,
+        [{ action: 'task-action-capability', sessionId: target.sessionId }], { preSend: assertCurrent });
+      assertCurrent();
+      if (!support.ok) return probeFailure(support.error.code, support.error.message);
+      const capabilities = support.result as { taskActionVersion?: unknown; turnControlVersion?: unknown } | null;
+      if (capabilities?.taskActionVersion !== 1 || capabilities.turnControlVersion !== 1) return unsupported;
+      receiptId = issueRemoteTaskActionReceipt(
+        { ...target, senderSessionId: actor.sessionId, operation: action, message }, assertCurrent, 'immediate',
+      );
+      const response = await deps.invoke(target.deviceId, DL_SESSION_HANDOFF_CHANNEL,
+        [{ action, sessionId: target.sessionId, message, sender: actor, taskActionReceipt: receiptId }], { preSend: assertCurrent });
+      assertCurrent();
+      if (!response.ok) return unknown;
+      const result = schema.safeParse(response.result);
+      return result.success ? result.data : unknown;
+    } catch (error) {
+      if (!receiptId && error instanceof DeviceLinkError) return probeFailure(error.code, error.message);
+      if (receiptId && error instanceof DeviceLinkError && error.inFlight === false) return unavailable;
+      return receiptId ? unknown : unavailable;
+    } finally {
+      // Turn actions are immediate. Loss of the reply never grants a queued input
+      // authority to run in a later turn.
+      if (receiptId) releaseRemoteTaskActionReceipt(receiptId);
+    }
+  }
+  return {
+    steer: (target: string, sender: () => Promise<{ sessionId: string; title?: string } | null>, message: string) =>
+      invokeTurn(target, sender, 'steer', message, steerReply),
+    stop: (target: string, sender: () => Promise<{ sessionId: string; title?: string } | null>) =>
+      invokeTurn(target, sender, 'stop-turn', STOP_TURN_RECEIPT_BODY, stopReply),
+  };
+}
+
+export function createRemoteSessionHandoff(deps: RemoteHandoffTransport & {
+  captureRequest?: (sessionId: string, supplement: string, target?: { sessionId?: string }) => Promise<CapturedAgentRequest>;
 }) {
   return async (
     target: QualifiedSessionTarget,

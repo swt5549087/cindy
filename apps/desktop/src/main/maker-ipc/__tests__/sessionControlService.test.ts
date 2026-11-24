@@ -768,6 +768,25 @@ describe('session control domain service', () => {
     expect(replacementRace.deps.steerQueuedMessage).not.toHaveBeenCalled();
   });
 
+  // Unit: the normal local stop fixture cannot catch authorization arriving
+  // after the remote target has moved to its next generation.
+  it.each(['steer', 'stop'] as const)('does not apply remote %s to a replacement turn', async operation => {
+    const { live, deps, service } = setup();
+    const beforeMutation = async () => { live.getTurnGeneration.mockReturnValue(4); };
+    if (operation === 'stop') {
+      await expect(service.stopSessionTurn({
+        targetSessionId: 'target', bindToCurrentTurn: true, beforeMutation,
+      })).resolves.toEqual({ ok: true, status: 'no-active-turn' });
+      expect(live.requestGracefulStop).not.toHaveBeenCalled();
+    } else {
+      await expect(service.steerSession({
+        targetSessionId: 'target', message: 'urgent', beforeMutation,
+        remoteInput: { build: async () => item(), assertAllowed: async () => {}, beforeProviderStart: async () => {} },
+      })).resolves.toMatchObject({ ok: false, errorCode: 'NO_ACTIVE_TURN' });
+      expect(deps.steerQueuedMessage).not.toHaveBeenCalled();
+    }
+  });
+
   it('merges canonical activity with live stop control without hard-abort semantics', async () => {
     const { live, service } = setup();
     await expect(service.stopSessionTurn({ targetSessionId: 'target' })).resolves.toEqual({

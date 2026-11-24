@@ -9,11 +9,12 @@ import { DL_SESSION_HANDOFF_CHANNEL } from '@cindy/device-link';
 import { sanitizeSourceName } from '@cindy/maker-shared/message-source';
 import type { AgentInputQueuedMessage } from '../../shared/agentInputQueue.js';
 import { getDeviceLinkInvokeContext } from '../device-link/invoke-context.js';
-import { hasRemoteBotSessionLookup } from '../device-link/remoteBotSessionBoundary.js';
+import { assertRemoteBotInvocationAllowed, hasRemoteBotSessionLookup } from '../device-link/remoteBotSessionBoundary.js';
 import { requireObject, throwIpcError } from '../utils/ipcValidate.js';
 import type { TaskActionDeliveryGuard } from './taskActionAuthorization.js';
-import { validateRemoteTaskActionReceipt } from './remoteTaskActionReceipt.js';
+import { STOP_TURN_RECEIPT_BODY, validateRemoteTaskActionReceipt } from './remoteTaskActionReceipt.js';
 import { TASK_STATUS_RECEIPT_OPERATION, taskDispatchClientId } from './taskDispatchReceipt.js';
+import type { SessionSteerResult, SessionStopResult } from './sessionControlService.js';
 
 /**
  * `maker:session:handoff` 的被控端业务体：同账号另一台电脑上的任务，把一条消息发给
@@ -62,22 +63,34 @@ export function createSessionHandoffHandler(deps: {
   refineTitle?(sessionId: string, subject: string, initialTitle: string): void;
   listProjects?(options: { includeHidden: boolean; offset: number; limit: number }): Promise<unknown>;
   canReceiveTaskStatusReceipt?(target: string): boolean;
+  captureTurnControlOwner?(): () => void;
+  turnControl?(input: {
+    action: 'steer' | 'stop-turn';
+    targetSessionId: string;
+    senderSessionId: string;
+    senderSessionTitle?: string;
+    message: string;
+    receiptId: string;
+    guard: TaskActionDeliveryGuard;
+    beforeProviderStart: () => Promise<void>;
+  }): Promise<SessionSteerResult | SessionStopResult>;
   validate?(controllerDeviceId: string, input: { receiptId: string; sessionId?: string; pluginId?: string; targetSessionId: string; message: string; release?: boolean; operation?: string }): Promise<boolean>;
 }) {
   // Claim before the first await. The sender receipt expires after one hour; retain
   // claims longer so transport replay cannot enqueue a second copy in that lifetime.
   const claimed = new Map<string, number>();
-  return async (controllerDeviceId: string, value: unknown): Promise<SessionHandoffSendResult> => {
+  return async (controllerDeviceId: string, value: unknown): Promise<SessionHandoffSendResult | SessionSteerResult | SessionStopResult> => {
     const request = requireObject(value, 'request');
     const targetSessionId = boundedString(request.sessionId, 'sessionId', 512);
+    const turnAction = request.action === 'steer' || request.action === 'stop-turn' ? request.action : undefined;
     const creation = request.action === 'create' ? remoteSessionCreationSchema.parse(request.create) : undefined;
-    if (request.action !== undefined && request.action !== 'create') throwIpcError('INVALID_PARAMS', 'Unknown handoff action');
+    if (request.action !== undefined && request.action !== 'create' && !turnAction) throwIpcError('INVALID_PARAMS', 'Unknown handoff action');
     if (creation && (!deps.create || !z.uuid().safeParse(targetSessionId).success))
       return { ok: false, errorCode: 'INVALID_ARGS', message: 'Remote creation requires a new UUID and a supported host.' };
     const automaticReceipt = request.taskStatusReceipt === true;
     if (request.taskStatusReceipt !== undefined && (!automaticReceipt || creation || request.requestSource !== undefined))
       throwIpcError('INVALID_PARAMS', 'Invalid automatic task status receipt');
-    const operation = creation ? creationOperation(creation) : automaticReceipt ? TASK_STATUS_RECEIPT_OPERATION : undefined;
+    const operation = creation ? creationOperation(creation) : turnAction ?? (automaticReceipt ? TASK_STATUS_RECEIPT_OPERATION : undefined);
     // 目标必须是本机任务；带设备前缀的 id 属于别的电脑，不代为转发。
     if (targetSessionId.includes('::'))
       throwIpcError('INVALID_PARAMS', 'Handoff cannot forward to another device');
@@ -90,6 +103,10 @@ export function createSessionHandoffHandler(deps: {
     const sender = requireObject(request.sender, 'sender');
     // 任务 id 是不透明字符串（IM 任务的 id 可以很长）；只拒绝会伪造设备前缀或说明结构的写法。
     const plugin = sender.kind === 'plugin';
+    if (turnAction && (plugin || request.requestSource !== undefined || request.taskStatusReceipt !== undefined
+      || request.create !== undefined || (turnAction === 'stop-turn' && body !== STOP_TURN_RECEIPT_BODY))) {
+      throwIpcError('INVALID_PARAMS', 'Invalid remote turn action');
+    }
     const senderPluginId = plugin ? boundedString(sender.pluginId, 'sender.pluginId', 512) : undefined;
     const senderSessionId = plugin ? undefined : boundedString(sender.sessionId, 'sender.sessionId', 512);
     const actorId = senderPluginId ?? senderSessionId!;
@@ -106,11 +123,53 @@ export function createSessionHandoffHandler(deps: {
       return { ok: false, errorCode: 'UNSUPPORTED_CAPABILITY', message: 'The task does not accept automatic status receipts.' };
     }
     const receiptId = boundedString(request.taskActionReceipt, 'taskActionReceipt', 128);
+    if (turnAction && (!deps.turnControl || !deps.captureTurnControlOwner)) {
+      return { ok: false, errorCode: 'UNSUPPORTED_CAPABILITY', message: 'Remote turn control is unavailable.' };
+    }
     for (const [key, expires] of claimed) if (expires <= Date.now()) claimed.delete(key);
     const claimKey = JSON.stringify([controllerDeviceId, receiptId]);
     if (claimed.has(claimKey) || claimed.size >= 1024)
       return { ok: false, errorCode: creation ? 'DELIVERY_UNKNOWN' : 'UNSUPPORTED_CAPABILITY', message: 'Task action already claimed or pending limit reached; inspect the target before retrying.' };
     claimed.set(claimKey, Date.now() + 2 * 60 * 60_000);
+    if (turnAction) {
+      const assertOwner = deps.captureTurnControlOwner!();
+      let active = true;
+      let authorized: Promise<boolean> | undefined;
+      let consumed = false;
+      const verify = (release: boolean) => deps.validate!(controllerDeviceId, {
+        receiptId, ...actor, targetSessionId, message: body, operation: turnAction, release,
+      });
+      const assertLocal = async () => {
+        assertOwner();
+        await assertRemoteBotInvocationAllowed([{ sessionId: targetSessionId }], DL_SESSION_HANDOFF_CHANNEL);
+        assertOwner();
+        if (!active) throw new Error('TASK_ACTION_AUTHORIZATION_EXPIRED');
+      };
+      const guard: TaskActionDeliveryGuard = async () => {
+        await assertLocal();
+        if (!await (authorized ??= verify(false))) throw new Error('TASK_ACTION_AUTHORIZATION_EXPIRED');
+        assertOwner();
+        if (!active) throw new Error('TASK_ACTION_AUTHORIZATION_EXPIRED');
+      };
+      const beforeProviderStart = async () => {
+        await assertLocal();
+        consumed = await verify(true);
+        if (!consumed) throw new Error('TASK_ACTION_AUTHORIZATION_EXPIRED');
+        await assertLocal();
+      };
+      try {
+        return await deps.turnControl!({
+          action: turnAction, targetSessionId, senderSessionId: `${controllerDeviceId}::${senderSessionId}`,
+          senderSessionTitle, message: body, receiptId, guard, beforeProviderStart,
+        });
+      } finally {
+        active = false;
+        // A rejected/local-only attempt has no input to resume later. Settle
+        // valid unused receipts before removing their replay claim.
+        const verified = authorized && await authorized.catch(() => false);
+        if (consumed || !verified || await verify(true).catch(() => false)) claimed.delete(claimKey);
+      }
+    }
     const taskActionDeliveryGuard: TaskActionDeliveryGuard = async () => {
       if (automaticReceipt && deps.canReceiveTaskStatusReceipt?.(targetSessionId) !== true)
         throw new Error('TASK_STATUS_RECEIPT_UNAVAILABLE');
@@ -200,6 +259,7 @@ export function registerSessionHandoffIpc(
       ...(deps.create && deps.refineTitle ? { ordinaryCreateAutoTitle: 1 } : {}),
       ...(deps.listProjects ? { projectCatalogVersion: 1 } : {}),
       ...(deps.canReceiveTaskStatusReceipt ? { taskStatusReceipt: 1 } : {}),
+      ...(deps.turnControl && deps.captureTurnControlOwner ? { turnControlVersion: 1 } : {}),
     };
     if (request.action === 'list-projects') {
       if (!deps.listProjects) throwIpcError('UNSUPPORTED_CAPABILITY', 'Project catalog is unavailable');

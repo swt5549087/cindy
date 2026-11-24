@@ -8557,13 +8557,24 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     enforceReviewCreateOptions(o);
   }
 
-  async function assertReviewExternalInputAllowed(sessionId: string): Promise<void> {
+  async function assertReviewExternalInputAvailable(sessionId: string): Promise<void> {
     const source = await readSessionSource(sessionId);
     assertCindyMakeSessionAvailable(source);
     await assertReviewSessionExternalInputAllowed(sessionId, async () => source);
+  }
+
+  async function assertReviewExternalInputAllowed(sessionId: string): Promise<void> {
+    await assertReviewExternalInputAvailable(sessionId);
     // This shared admission boundary precedes both direct and queued/steered
     // Cindy input. Merely opening/viewing the task does not transfer ownership.
     await takeOverLocalAgentVisibleSession(sessionId);
+  }
+
+  async function assertRemoteTurnControlAllowed(sessionId: string): Promise<void> {
+    await assertReviewExternalInputAvailable(sessionId);
+    if (hasLocalAgentVisibleRuntime(sessionId)) {
+      throwIpcError('UNSUPPORTED_CAPABILITY', 'Turn control cannot take over a plugin-owned runtime.');
+    }
   }
 
   async function assertReviewSettingsUnlocked(sessionId: string, sendLockHeld = false): Promise<void> {
@@ -13508,6 +13519,35 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   // 同账号另一台电脑上的任务发来的消息（Agent 的 send_to_session 传 deviceId::sessionId）。
   registerSessionHandoffIpc({
+    captureTurnControlOwner: () => captureSessionOwner(),
+    turnControl: ({ action, targetSessionId, senderSessionId, senderSessionTitle, message, receiptId, guard, beforeProviderStart }) => {
+      const assertAllowed = () => assertRemoteTurnControlAllowed(targetSessionId);
+      const authorizeAtBoundary = async () => {
+        await assertAllowed();
+        await beforeProviderStart();
+      };
+      if (action === 'stop-turn') {
+        return sessionControlService.stopSessionTurn({
+          targetSessionId, bindToCurrentTurn: true, beforeMutation: authorizeAtBoundary,
+        });
+      }
+      return sessionControlService.steerSession({
+        targetSessionId, message, queuedMessageId: `remote-task-action:${receiptId}`, beforeMutation: guard,
+        remoteInput: {
+          assertAllowed, beforeProviderStart: authorizeAtBoundary,
+          build: async clientId => {
+            const meta = await maker.getSessionMeta(targetSessionId);
+            if (!meta) throw new Error('Target task disappeared');
+            return buildSessionControlInputItem({
+              targetSessionId, meta, message, persistedContent: message, clientId,
+              origin: { kind: 'session', senderSessionId, senderSessionTitle, displayText: message },
+              autoReviewUserText: { kind: 'agent-request' },
+              taskActionDeliveryGuard: guard,
+            });
+          },
+        },
+      });
+    },
     canReceiveTaskStatusReceipt: id => !isSessionSharedTaskActive(id),
     refineTitle: (id, subject, initial) => { void refineCreatedTaskTitle(id, subject, { initialTitle: initial }); },
     listProjects: options => listProjects({ ...options, callerSessionId: undefined }),
@@ -17794,6 +17834,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         expectedTurnSession: expectedTurn.session,
         expectedTurnGeneration: expectedTurn.turnGeneration,
         beforeMutation: expectedTurn.beforeMutation,
+        beforeProviderStart: expectedTurn.beforeProviderStart,
       });
     },
     getQueueSnapshot: async (sessionId) => {
@@ -18999,7 +19040,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   const steerToAgentAccepted = createMakerSteerTransaction({
     maker,
     assertInputAllowed: async sessionId => {
-      await assertReviewExternalInputAllowed(sessionId);
+      if (getDeviceLinkInvokeContext()?.channel === 'maker:session:handoff') {
+        await assertRemoteTurnControlAllowed(sessionId);
+      } else {
+        await assertReviewExternalInputAllowed(sessionId);
+      }
       const [botInput] = await getDbClient()
         .drizzle.select({
           source: sessions.source,

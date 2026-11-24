@@ -6,6 +6,7 @@ import { z } from 'zod';
 import type { XdtHelperToolRegistry } from '../lizi_xdtHelperToolRegistry.js';
 import type { ControlResult, LiziMcpSessionContext } from '../types.js';
 import { errorPayload, okPayload } from './_payload.js';
+import { parseQualifiedSessionId } from './send_to_session.js';
 
 export type SessionQueueControlErrorCode =
   | 'NOT_FOUND'
@@ -22,14 +23,17 @@ export type SessionQueueSteerReason =
   | 'INPUT_BOUNDARY_BUSY'
   | 'STEER_UNCERTAIN';
 
+type RemoteTurnControlError = 'INVALID_ARGS' | 'REMOTE_UNAVAILABLE' | 'DELIVERY_UNKNOWN';
+
 export type SessionSteerErrorCode =
   | 'NOT_FOUND'
   | 'NO_ACTIVE_TURN'
   | 'UNSUPPORTED_CAPABILITY'
   | 'INPUT_LOCKED'
-  | 'DELIVERY_FAILED';
+  | 'DELIVERY_FAILED'
+  | RemoteTurnControlError;
 
-export type SessionStopErrorCode = 'NOT_FOUND' | 'UNSUPPORTED_CAPABILITY';
+export type SessionStopErrorCode = 'NOT_FOUND' | 'UNSUPPORTED_CAPABILITY' | RemoteTurnControlError;
 
 export interface SessionRuntimeProfile {
   agentKind: AgentKind;
@@ -101,6 +105,7 @@ export interface SessionControlDeps {
     message: string;
   }): Promise<ControlResult<{ queuedMessageId: string }, SessionSteerErrorCode>>;
   stopSessionTurn(params: {
+    callerSessionId?: string;
     targetSessionId: string;
   }): Promise<
     ControlResult<
@@ -335,10 +340,10 @@ export function registerSteerSessionTool(
     name: 'steer_session',
     category: 'control',
     description:
-      '向正在运行的本机 session 高优先级插话；消息复用该 session 的原生 same-turn steer，' +
+      '向正在运行的本机或已授权电脑的 session 高优先级插话；消息复用该 session 的原生 same-turn steer，' +
       '在 provider 的下一个输入安全间隙可见，不等待当前 turn 结束。目标不在运行或不支持时明确失败。',
     inputShape: {
-      session_id: z.string().min(1).describe('目标 session id。'),
+      session_id: z.string().min(1).describe('目标 session id；跨电脑用 device_id::session_id。'),
       message: z.string().min(1).describe('要注入当前 turn 的完整消息正文。'),
     },
     handler: async ({ session_id, message }) => {
@@ -346,9 +351,10 @@ export function registerSteerSessionTool(
       if (!callerSessionId && deps.getSessionContext().hostCaller?.kind !== 'plugin') {
         return errorPayload('NO_SESSION_CONTEXT', '当前 MCP 调用没有绑定 session，无法记录插话来源。');
       }
+      const qualified = parseQualifiedSessionId(session_id);
       const result = await deps.steerSession({
         callerSessionId: callerSessionId ?? undefined,
-        targetSessionId: session_id,
+        targetSessionId: qualified?.deviceId === 'local' ? qualified.sessionId : session_id,
         message,
       });
       if (!result.ok) return mapControlFailure(result);
@@ -369,13 +375,16 @@ export function registerStopSessionTurnTool(
     name: 'stop_session_turn',
     category: 'control',
     description:
-      '请求另一个本机 session 的当前 turn 优雅停止。若正在执行工具，会等全部当前工具结果返回后再发送 provider 软中断；' +
+      '请求本机或已授权电脑上 session 的当前 turn 优雅停止。若正在执行工具，会等全部当前工具结果返回后再发送 provider 软中断；' +
       '不会关闭 transport、重建 session 或硬杀进程。',
     inputShape: {
-      session_id: z.string().min(1).describe('目标 session id。'),
+      session_id: z.string().min(1).describe('目标 session id；跨电脑用 device_id::session_id。'),
     },
     handler: async ({ session_id }) => {
-      const result = await deps.stopSessionTurn({ targetSessionId: session_id });
+      const qualified = parseQualifiedSessionId(session_id);
+      const targetSessionId = qualified?.deviceId === 'local' ? qualified.sessionId : session_id;
+      const callerSessionId = qualified && qualified.deviceId !== 'local' ? requireCallerSession(deps) : undefined;
+      const result = await deps.stopSessionTurn({ targetSessionId, ...(callerSessionId ? { callerSessionId } : {}) });
       if (!result.ok) return mapControlFailure(result);
       return okPayload({
         session_id,

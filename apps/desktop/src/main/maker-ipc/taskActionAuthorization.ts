@@ -105,6 +105,7 @@ interface ActionContext {
 }
 const actionContext = new AsyncLocalStorage<ActionContext>();
 export const TASK_ACTION_INPUT_GUARD = Symbol('task-action-input-guard');
+export const REMOTE_STEER_PROVIDER_GUARD = Symbol('remote-steer-provider-guard');
 export type TaskActionDeliveryGuard = (() => Promise<void>) & {
   onSettled?: () => Promise<void>;
 };

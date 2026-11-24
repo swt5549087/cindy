@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { captureTaskActionDeliveryGuard } from './taskActionAuthorization.js';
+import { captureTaskActionDeliveryGuard, captureTaskActionGuard } from './taskActionAuthorization.js';
+
+export const STOP_TURN_RECEIPT_BODY = 'stop current turn';
 
 /** Ephemeral handoff receipts. A restart cannot resurrect a remote queued intervention. */
 const receipts = new Map<
@@ -21,10 +23,11 @@ export function issueRemoteTaskActionReceipt(
   input: { deviceId: string; sessionId: string; message: string; operation?: string } &
     ({ senderSessionId: string; senderPluginId?: never } | { senderPluginId: string; senderSessionId?: never }),
   assertAccount: () => void,
+  lifetime: 'queued' | 'immediate' = 'queued',
 ): string {
   for (const [id, receipt] of receipts) if (receipt.expiresAt <= Date.now()) receipts.delete(id);
   if (receipts.size >= 256) throw new Error('Too many pending remote task actions');
-  const guard = captureTaskActionDeliveryGuard();
+  const guard = lifetime === 'immediate' ? captureTaskActionGuard() : captureTaskActionDeliveryGuard();
   const id = randomUUID();
   receipts.set(id, {
     ...input,

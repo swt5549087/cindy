@@ -14,6 +14,7 @@ import { buildClientEnvironmentNote, shouldPrependMobileClientPromptNote } from 
 import { buildWireMessageSourceNote, readWireSourceDevice } from './messageSourceNote.js';
 import { SIDE_CHAT_CONTEXT } from './sideChatContext.js';
 import { buildUiLanguageErrorNote, turnClassicalStyleFromSendOpts, turnUiLanguageFromSendOpts } from './uiLanguageErrorNote.js';
+import { REMOTE_STEER_PROVIDER_GUARD } from './taskActionAuthorization.js';
 
 import type { Session } from '@cindy/maker-core';
 import type { AgentSendToSessionHint } from '@cindy/maker-shared/agent-input-projection';
@@ -62,6 +63,7 @@ export function createMakerSteerTransaction(deps: MakerSteerTransactionDeps) {
       userName?: string;
       signal?: AbortSignal;
       beforeProviderStart?: () => Promise<void>;
+      [REMOTE_STEER_PROVIDER_GUARD]?: () => Promise<void>;
       /** coordinator 从队列项透传的手机来源(main 构造,非 wire 输入)。 */
       fromMobileClient?: boolean;
       uiLanguage?: string;
@@ -242,17 +244,23 @@ export function createMakerSteerTransaction(deps: MakerSteerTransactionDeps) {
       if (so[MCP_APP_MESSAGE_GUARD]) await so[MCP_APP_MESSAGE_GUARD]!();
       await so.beforeProviderStart?.();
       sess = readCurrentSteerSession();
-      // 同轮插话也属于新输入。必须在 vendor await 前通知，旧轮可能先于 steer ack 结束。
-      // 共用入口同时覆盖 INPUT_STEER、队列提升和旧 STEER IPC。
-      publishUiSessionIntervention(sessionId);
-      // A channel route vouches only for its triggering sender; steered input ends that.
-      noteInteractionRouteSteer(sess);
+      const remoteGuard = so[REMOTE_STEER_PROVIDER_GUARD];
+      const publishIntervention = (session: Session) => {
+        // The earlier turn can finish before the provider acknowledges the steer.
+        publishUiSessionIntervention(sessionId);
+        noteInteractionRouteSteer(session);
+      };
+      if (!remoteGuard) publishIntervention(sess);
       await sess.steer(steerPayload as never, {
-        ...(so[MCP_APP_MESSAGE_GUARD] || so.beforeProviderStart || appContext?.text ? {
+        ...(so[MCP_APP_MESSAGE_GUARD] || so.beforeProviderStart || appContext?.text || remoteGuard ? {
           beforeProviderStart: async () => {
             await so[MCP_APP_MESSAGE_GUARD]?.();
             await appContext?.assertCurrent();
             await so.beforeProviderStart?.();
+            if (remoteGuard) {
+              await remoteGuard();
+              publishIntervention(readCurrentSteerSession());
+            }
           },
         } : {}),
         logTitle: meta?.title,

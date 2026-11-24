@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { captureAgentRequest } from '../forwardedRequest.js';
-import { createRemoteSessionHandoff } from '../../mcp-integrations/sessionHandoffRemote.js';
+import { createRemoteSessionHandoff, createRemoteSessionTurnControl } from '../../mcp-integrations/sessionHandoffRemote.js';
 import { validateRemoteTaskActionReceipt } from '../remoteTaskActionReceipt.js';
 import { TASK_STATUS_RECEIPT_OPERATION, taskDispatchInput } from '../taskDispatchReceipt.js';
 import { bindTaskActionInput, settleTaskActionInput, taskActionInputGuard } from '../taskActionAuthorization.js';
@@ -55,6 +55,66 @@ const request = {
   message: 'hello',
   sender: { sessionId: 'sender-1', title: 'PR 跟进' },
 };
+
+// Unit/protocol: exercise both production handoff ends and the real receipt.
+// Unlike ordinary delivery, a turn action requires explicit peer capability
+// and cannot be replayed or exchanged for another action.
+it.each(['steer', 'stop-turn', 'old-peer', 'wrong-action', 'revoked'] as const)(
+  'negotiates and binds a remote turn action (%s)', async scenario => {
+    const { send } = setup();
+    const applied = vi.fn();
+    const verify = vi.fn(validateRemoteTaskActionReceipt);
+    let current = true;
+    const receiver = createSessionHandoffHandler({
+      send,
+      validate: (_source, input) => verify('target-device', input),
+      captureTurnControlOwner: () => () => {},
+      turnControl: async ({ action, senderSessionId, guard, beforeProviderStart }) => {
+        if (action === 'steer') await guard();
+        if (scenario === 'revoked') current = false;
+        await beforeProviderStart();
+        applied(action, senderSessionId);
+        return action === 'steer'
+          ? { ok: true, queuedMessageId: 'input-id' }
+          : { ok: true, status: 'waiting-for-safe-point', turnGeneration: 3 };
+      },
+    });
+    let wire: Record<string, unknown> | undefined;
+    const remote = createRemoteSessionTurnControl({
+      captureAccess: () => () => { if (!current) throw new Error('Revoked'); },
+      invoke: async (_device, _channel, args) => {
+        const body = args[0] as Record<string, unknown>;
+        if (body.action === 'task-action-capability') return {
+          ok: true, result: { taskActionVersion: 1, ...(scenario !== 'old-peer' ? { turnControlVersion: 1 } : {}) },
+        };
+        wire = scenario === 'wrong-action' ? { ...body, action: 'steer' } : body;
+        return { ok: true, result: await receiver('source-device', wire) };
+      },
+    });
+    const actor = async () => ({ sessionId: 'caller' });
+    const result = scenario === 'stop-turn' || scenario === 'wrong-action'
+      ? await remote.stop('target-device::target', actor)
+      : await remote.steer('target-device::target', actor, 'urgent');
+    expect(send).not.toHaveBeenCalled();
+    if (scenario === 'old-peer') {
+      expect(result).toMatchObject({ ok: false, errorCode: 'UNSUPPORTED_CAPABILITY' });
+      expect(wire).toBeUndefined();
+      return;
+    }
+    if (scenario === 'wrong-action' || scenario === 'revoked') {
+      expect(result).toMatchObject({ ok: false, errorCode: 'DELIVERY_UNKNOWN' });
+      expect(applied).not.toHaveBeenCalled();
+      return;
+    }
+    expect(result).toMatchObject(scenario === 'steer'
+      ? { ok: true, queuedMessageId: 'input-id' }
+      : { ok: true, status: 'waiting-for-safe-point', turnGeneration: 3 });
+    expect(applied).toHaveBeenCalledWith(scenario, 'source-device::caller');
+    expect(verify).toHaveBeenCalledTimes(scenario === 'steer' ? 2 : 1);
+    await expect(receiver('source-device', wire)).rejects.toThrow('AUTHORIZATION_EXPIRED');
+    expect(applied).toHaveBeenCalledOnce();
+  },
+);
 
 function creationFixture() {
   const id = '22222222-2222-4222-8222-222222222222';

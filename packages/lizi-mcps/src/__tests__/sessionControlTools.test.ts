@@ -373,6 +373,26 @@ describe('cindy_helper session control tools', () => {
     expect(deps.moveQueuedMessage).toHaveBeenCalledTimes(1);
   });
 
+  // Unit: the registry must keep a remote device qualifier and bind the
+  // authenticated caller, while local:: still selects the existing local path.
+  it('preserves the device and caller for turn control', async () => {
+    const { deps, registry } = setup();
+    const session_id = 'device-a::target-session';
+    expect(parse(await registry.call('stop_session_turn', { session_id }))).toMatchObject({
+      ok: true, session_id, status: 'waiting-for-safe-point',
+    });
+    expect(deps.stopSessionTurn).toHaveBeenCalledWith({
+      targetSessionId: session_id, callerSessionId: 'caller-session',
+    });
+
+    expect(parse(await registry.call('steer_session', {
+      session_id: 'local::target-session', message: 'check this first',
+    }))).toMatchObject({ ok: true, steered: true });
+    expect(deps.steerSession).toHaveBeenCalledWith({
+      targetSessionId: 'target-session', callerSessionId: 'caller-session', message: 'check this first',
+    });
+  });
+
   it('steers, requests graceful stop and projects bounded runtime metadata', async () => {
     const { deps, registry } = setup();
 

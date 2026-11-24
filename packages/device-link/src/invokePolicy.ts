@@ -1,4 +1,4 @@
-import { INVOKE_TIMEOUT_OVERRIDES_MS } from './allowlist.js';
+import { DL_SESSION_HANDOFF_CHANNEL, INVOKE_TIMEOUT_OVERRIDES_MS } from './allowlist.js';
 import { REMOTE_DESKTOP_HEARTBEAT_TIMEOUT_MS } from './remoteDesktop.js';
 import {
   TASK_MIGRATION_CHANNEL,
@@ -71,9 +71,12 @@ const INTERACTIVE_INVOKE_CHANNELS = new Set([
 
 export function isInteractiveInvoke(channel: string, args?: readonly unknown[]): boolean {
   if (INTERACTIVE_INVOKE_CHANNELS.has(channel)) return true;
-  if (channel !== REMOTE_AGENT_CHANNEL) return false;
+  if (channel !== REMOTE_AGENT_CHANNEL && channel !== DL_SESSION_HANDOFF_CHANNEL) return false;
   const request = args?.[0];
   if (!request || typeof request !== 'object' || Array.isArray(request)) return false;
+  if (channel === DL_SESSION_HANDOFF_CHANNEL) {
+    return 'action' in request && (request.action === 'steer' || request.action === 'stop-turn');
+  }
   const { op, method, payload } = request as { op?: unknown; method?: unknown; payload?: unknown };
   // Keep bulk HTTP replies, execution frames, uploads and polls out of the
   // control allowance. Inspect only inline reply metadata, never decompress

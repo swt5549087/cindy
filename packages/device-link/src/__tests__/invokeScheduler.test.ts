@@ -333,6 +333,14 @@ describe("invoke admission", () => {
       expect(resolveInvokePriority(channel, true)).toBe("interactive");
     }
     // Queue-management edits and reads stay where they were.
+    // Unit/transport admission: reserve interactive slots for immediate turn
+    // actions, while ordinary handoff writes and capability reads stay foreground.
+    for (const action of ['steer', 'stop-turn']) {
+      expect(resolveInvokePriority('maker:session:handoff', undefined, [{ action }])).toBe('interactive');
+    }
+    for (const action of ['create', 'task-action-capability', 'validate-task-action']) {
+      expect(resolveInvokePriority('maker:session:handoff', undefined, [{ action }])).toBe('foreground');
+    }
     expect(resolveInvokePriority("maker:input:move")).toBe("foreground");
     expect(resolveInvokePriority("local-db:messages:view")).toBe("foreground");
     expect(resolveInvokePriority("local-db:messages:view", true)).toBe("background");

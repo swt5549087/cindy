@@ -6,7 +6,7 @@ import { TELEGRAM_QUESTION_ORIGIN, telegramQuestionAnswerOrigin, inheritTelegram
 import { ASYNC_QUESTION_ANSWER, SUPERSEDE_ASYNC_QUESTIONS, AUTO_REVIEW_SOURCE_CONTENT, AUTO_REVIEW_USER_INTENT } from '@cindy/maker-core';
 import { getDeviceLinkInvokeContext } from '../device-link/invoke-context.js';
 import { assertSharedTaskQueueMutation } from './sharedTaskInput.js';
-import { acceptTaskActionRecoveryCopy, assertTaskActionCurrent, bindTaskActionInput, combineInputGuards, hasTaskActionAuthorization, taskActionRevocationCode, taskActionInputGuard, TASK_ACTION_INPUT_GUARD } from './taskActionAuthorization.js';
+import { acceptTaskActionRecoveryCopy, assertTaskActionCurrent, bindTaskActionInput, combineInputGuards, hasTaskActionAuthorization, REMOTE_STEER_PROVIDER_GUARD, taskActionRevocationCode, taskActionInputGuard, TASK_ACTION_INPUT_GUARD } from './taskActionAuthorization.js';
 import { isBotGroupClientId } from '../../shared/botGroupChat.js';
 import { BOT_SUBSCRIPTION_STARTUP_ADMISSION_REASON } from './botCandidateRecovery.js';
 import { SchedulerQueuedPreparationError } from './schedulerQueuedPreparation.js';
@@ -248,6 +248,7 @@ export interface AgentInputSendOpts {
   readonly [SUPERSEDE_ASYNC_QUESTIONS]?: true;
   /** Main-only authorization recheck after async steer preparation, before provider dispatch. */
   beforeProviderStart?: () => Promise<void>;
+  readonly [REMOTE_STEER_PROVIDER_GUARD]?: () => Promise<void>;
   /** Main-only App grant, checked by the send/steer transaction at dispatch. */
   readonly [MCP_APP_MESSAGE_GUARD]?: McpAppMessageGuard;
   readonly [AUTO_REVIEW_DELEGATED_CONTINUATION]?: true;
@@ -1155,6 +1156,7 @@ interface SteerObservation {
 interface SteerOptions {
   /** Host-only authority check after async preparation and before native injection. */
   beforeMutation?: () => Promise<void>;
+  beforeProviderStart?: () => Promise<void>;
   removeFromQueue?: boolean;
   touchUserSend?: boolean;
   /** 控制面插话不允许在 turn 结束竞态下退化成下一轮普通输入。 */
@@ -3074,6 +3076,13 @@ export class AgentInputCoordinator {
       }), {
         ...(opts?.beforeMutation ? { beforeProviderStart: async () => {
           try { await opts.beforeMutation!(); }
+          catch (error) { authorizationFailed = true; throw error; }
+        } } : {}),
+        ...(opts?.beforeProviderStart ? { [REMOTE_STEER_PROVIDER_GUARD]: async () => {
+          try {
+            await opts.beforeProviderStart!();
+            if (!matchesExpectedTurn()) throw new Error('Steer target turn changed');
+          }
           catch (error) { authorizationFailed = true; throw error; }
         } } : {}),
         ...(appMessageGuard ? { [MCP_APP_MESSAGE_GUARD]: appMessageGuard } : {}),

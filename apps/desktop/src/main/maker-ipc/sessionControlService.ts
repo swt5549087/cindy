@@ -104,6 +104,7 @@ export interface SessionSteerTurnIdentity {
   session: SessionControlLiveSession;
   turnGeneration: number;
   beforeMutation?: () => Promise<void>;
+  beforeProviderStart?: () => Promise<void>;
 }
 
 export interface SessionControlServiceDeps {
@@ -319,13 +320,21 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       /** Host-owned stable ID; the input coordinator owns acceptance deduplication. */
       queuedMessageId?: string;
       beforeMutation?: () => Promise<void>;
+      remoteInput?: {
+        build(queuedMessageId: string): Promise<AgentInputQueuedMessage>;
+        assertAllowed(): Promise<void>;
+        beforeProviderStart(): Promise<void>;
+      };
     }): Promise<SessionSteerResult> {
+      const initialSession = params.remoteInput ? deps.getLiveSession(params.targetSessionId) : undefined;
+      const initialGeneration = initialSession?.getTurnGeneration();
       const beforeMutation = combineInputGuards(params.beforeMutation, assertTaskActionCurrent);
       const missing = await ensureTarget(params.targetSessionId);
       await beforeMutation?.();
       if (missing) return missing;
       try {
-        await deps.assertExternalInputAllowed(params.targetSessionId);
+        if (params.remoteInput) await params.remoteInput.assertAllowed();
+        else await deps.assertExternalInputAllowed(params.targetSessionId);
       } catch (error) {
         await beforeMutation?.();
         if ((error as { code?: unknown }).code === 'UNSUPPORTED_CAPABILITY') {
@@ -339,7 +348,8 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       }
       await beforeMutation?.();
       const live = deps.getLiveSession(params.targetSessionId);
-      if (!live?.isTurnRunning()) {
+      if (!live?.isTurnRunning() || (params.remoteInput &&
+        (live !== initialSession || live.getTurnGeneration() !== initialGeneration))) {
         return {
           ok: false,
           errorCode: 'NO_ACTIVE_TURN',
@@ -355,10 +365,10 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       }
       const turnGeneration = live.getTurnGeneration();
       const queuedMessageId = params.queuedMessageId ?? deps.createId();
-      const item: AgentInputQueuedMessage = await deps.createQueuedMessage({
+      const item: AgentInputQueuedMessage = await (params.remoteInput?.build(queuedMessageId) ?? deps.createQueuedMessage({
         ...params,
         queuedMessageId,
-      });
+      }));
       await beforeMutation?.();
       const current = deps.getLiveSession(params.targetSessionId);
       if (
@@ -372,7 +382,8 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
           message: `session ${params.targetSessionId} changed turns before steer was accepted`,
         };
       }
-      const expectedTurn = { session: live, turnGeneration, beforeMutation };
+      const expectedTurn = { session: live, turnGeneration, beforeMutation,
+        ...(params.remoteInput ? { beforeProviderStart: params.remoteInput.beforeProviderStart } : {}) };
       const accepted = await deps.steerQueuedMessage(params.targetSessionId, item, expectedTurn);
       if (!accepted) {
         const latest = deps.getLiveSession(params.targetSessionId);
@@ -393,12 +404,18 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       return { ok: true, queuedMessageId };
     },
 
-    async stopSessionTurn(params: { targetSessionId: string; beforeMutation?: () => Promise<void> }): Promise<SessionStopResult> {
+    async stopSessionTurn(params: { targetSessionId: string; beforeMutation?: () => Promise<void>; bindToCurrentTurn?: boolean }): Promise<SessionStopResult> {
+      const initialSession = params.bindToCurrentTurn ? deps.getLiveSession(params.targetSessionId) : undefined;
+      const initialGeneration = initialSession?.getTurnGeneration();
+      const wasRunning = initialSession?.isTurnRunning();
       const missing = await ensureTarget(params.targetSessionId);
       await combineInputGuards(params.beforeMutation, assertTaskActionCurrent)?.();
       if (missing) return missing;
       const live = deps.getLiveSession(params.targetSessionId);
-      if (!live) return { ok: true, status: 'no-active-turn' };
+      if (!live || (params.bindToCurrentTurn &&
+        (!wasRunning || live !== initialSession || live.getTurnGeneration() !== initialGeneration))) {
+        return { ok: true, status: 'no-active-turn' };
+      }
       const result = await live.requestGracefulStop();
       if (result.status === 'unsupported') {
         return {

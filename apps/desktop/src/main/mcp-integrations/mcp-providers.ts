@@ -177,7 +177,7 @@ import {
 } from './remoteChatHistory.js';
 import { botSessionLinks, sessions } from '../localDb/schema.js';
 import { createSchedulerRemoteDeps } from './schedulerDevices.js';
-import { createRemoteSessionHandoff } from './sessionHandoffRemote.js';
+import { createRemoteSessionHandoff, createRemoteSessionTurnControl } from './sessionHandoffRemote.js';
 import { createRemoteSessionsSnoozeSetter, createRemoteSessionsStatusSetter, remoteSessionMutationFailure } from './sessionStatusRemote.js';
 import { DeviceLinkError } from '@cindy/device-link';
 import { MAKER_INVOKE } from '../maker-ipc/channels.js';
@@ -299,6 +299,11 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         invoke: deps.invokeRemote,
       })
     : null;
+  const remoteTurnControl = deps.historyRemote
+    ? createRemoteSessionTurnControl({ captureAccess: deps.historyRemote.captureAccess, invoke: deps.invokeRemote })
+    : null;
+  const turnControlUnavailable = { ok: false as const, errorCode: 'UNSUPPORTED_CAPABILITY' as const,
+    message: 'Cross-computer turn control is unavailable on this host.' };
   // 跨电脑投递的来源:发起任务的 id 与标题(对方按「由任务「X」发送」标注来源)。
   const remoteHandoffSender = async (dispatcherSessionId: string | undefined) => {
     if (!dispatcherSessionId) {
@@ -312,6 +317,11 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         .where(eq(sessions.id, dispatcherSessionId)).limit(1).catch(() => [])
       : [];
     return { sessionId: dispatcherSessionId, ...(row?.title ? { title: row.title } : {}) };
+  };
+  const remoteTurnSender = async (callerSessionId: string | undefined) => {
+    if (!callerSessionId) return null;
+    const sender = await remoteHandoffSender(callerSessionId);
+    return 'sessionId' in sender && sender.sessionId ? { sessionId: sender.sessionId, title: sender.title } : null;
   };
 
   const readTaskDigest = createTaskDigestReader(createDesktopTaskDigestDeps({
@@ -1046,9 +1056,20 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         cancelQueuedMessage: wrap((service, params) => service.cancelSessionQueuedMessage(params)),
         steerQueuedMessage: wrap((service, params) => service.steerSessionQueuedMessage(params)),
         moveQueuedMessage: wrap((service, params) => service.moveSessionQueuedMessage(params)),
-        steerSession: wrap((service, params) => trackTaskDispatchReply(
-          params.callerSessionId, params.targetSessionId, () => service.steerSession(params))),
-        stopSessionTurn: wrap((service, params) => service.stopSessionTurn(params)),
+        steerSession: wrap(async (service, params) => {
+          if (params.targetSessionId.includes('::')) {
+            return remoteTurnControl?.steer(params.targetSessionId, () => remoteTurnSender(params.callerSessionId), params.message)
+              ?? turnControlUnavailable;
+          }
+          return trackTaskDispatchReply(params.callerSessionId, params.targetSessionId, () => service.steerSession(params));
+        }),
+        stopSessionTurn: wrap(async (service, params) => {
+          if (params.targetSessionId.includes('::')) {
+            return remoteTurnControl?.stop(params.targetSessionId, () => remoteTurnSender(params.callerSessionId))
+              ?? turnControlUnavailable;
+          }
+          return service.stopSessionTurn(params);
+        }),
         getSessionRuntime: wrap((service, params) => service.getSessionRuntime(params)),
         setSessionRuntime: wrap((service, params) => service.setSessionRuntime(params)),
       },
