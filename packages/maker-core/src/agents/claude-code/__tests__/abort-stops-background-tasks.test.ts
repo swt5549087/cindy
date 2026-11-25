@@ -221,6 +221,8 @@ async function startSessionWithStream(
     autoCompactThresholdPct?: number;
     capturePrompts?: boolean;
     resolveModelContextLimit?: AgentDeps['resolveModelContextLimit'];
+    canWakeClaudeAfterCommandExit?: (sessionId: string, instanceId: string) => boolean;
+    observePrompt?: (prompt: unknown) => void;
   },
 ) {
   const configDir = await makeTempDir();
@@ -248,8 +250,8 @@ async function startSessionWithStream(
     if (prompt && !opts?.capturePrompts) {
       void (async () => {
         try {
-          for await (const ignored of prompt) {
-            void ignored;
+          for await (const input of prompt) {
+            opts?.observePrompt?.(input);
           }
         } catch { /* end / abort 都算正常收尾 */ }
       })();
@@ -267,9 +269,11 @@ async function startSessionWithStream(
       },
     }),
     capabilityAdditions: { availableModels: TEST_MODELS },
+    canWakeClaudeAfterCommandExit: opts?.canWakeClaudeAfterCommandExit,
   });
   const handle = await agent.startSession({
     sessionId: 'session-stop-task',
+    sessionInstanceId: 'session-stop-instance',
     model: 'claude-opus-4-6',
     workingDir,
     permissionMode: 'acceptEdits',
@@ -3479,6 +3483,56 @@ it('applies an explicit model window to Claude runtime and compression accountin
 // follow-up. Existing wake tests only cover Agent/Workflow claims, not this gap.
 // Unit: synthetic SDK stream; no real Claude, DB, IM or App acceptance claim.
 describe('completed Bash runtime retention', () => {
+  // Unit: the real SDK event adapter must start one provider turn for a
+  // tracked work exit after native grace, and yield to native or host control.
+  it.each(['fallback', 'native', 'host-busy', 'cancelled', 'untracked', 'stopped', 'finished-before-turn', 'superseded', 'plan'] as const)(
+    'only wakes after a confirmed work exit with no competing turn (%s)',
+    async scenario => {
+      const guard = vi.fn(() => scenario !== 'host-busy');
+      const observePrompt = vi.fn();
+      const { handle, stream, events, collected } = await startSessionWithStream(undefined, {
+        canWakeClaudeAfterCommandExit: guard,
+        observePrompt,
+      });
+      vi.useFakeTimers();
+      try {
+        await handle.send({ type: 'user', content: 'run a background command' },
+          scenario === 'plan' ? { planMode: true } : undefined);
+        if (scenario !== 'untracked') stream.emit(taskStarted('bash', 'local_bash'));
+        if (scenario === 'finished-before-turn') stream.emit(taskNotification('bash', 'completed'));
+        stream.emit(turnResult('foreground done'));
+        await vi.advanceTimersByTimeAsync(0);
+        if (scenario === 'superseded') {
+          await handle.send({ type: 'user', content: 'a different request' });
+          stream.emit(turnResult('new foreground done'));
+          await vi.advanceTimersByTimeAsync(0);
+        }
+        stream.emit(taskNotification('bash', scenario === 'stopped' ? 'stopped' : 'completed'));
+        stream.emit(taskNotification('bash', scenario === 'stopped' ? 'stopped' : 'completed'));
+        await vi.advanceTimersByTimeAsync(0);
+        if (scenario === 'native') stream.emit(assistantText('native follow-up'));
+        if (scenario === 'cancelled') handle.cancelPendingBackgroundWake?.();
+        await vi.advanceTimersByTimeAsync(WAKE_CONTRACT_GRACE_MS);
+        const wakes = () => events.filter(e => e.type === 'status' &&
+          (e.data as { providerInitiatedTurn?: boolean } | undefined)?.providerInitiatedTurn);
+        expect(wakes()).toHaveLength(scenario === 'fallback' || scenario === 'native' ? 1 : 0);
+        expect(guard).toHaveBeenCalledTimes(scenario === 'fallback' || scenario === 'host-busy' ? 1 : 0);
+        if (scenario === 'fallback') {
+          expect(handle.isTurnRunning?.()).toBe(true);
+          expect(observePrompt).toHaveBeenCalledTimes(2);
+          expect(observePrompt.mock.calls[1][0]).toMatchObject({
+            message: { role: 'user', content: expect.stringContaining('Check its result') },
+          });
+          stream.emit(taskStarted('next', 'local_bash'));
+          stream.emit(turnResult('fallback done'));
+          stream.emit(taskNotification('next', 'completed'));
+          await vi.advanceTimersByTimeAsync(WAKE_CONTRACT_GRACE_MS);
+          expect(wakes()).toHaveLength(1);
+          expect(guard).toHaveBeenCalledOnce();
+        } else expect(observePrompt).toHaveBeenCalledTimes(scenario === 'superseded' ? 2 : 1);
+      } finally { vi.useRealTimers(); stream.end(); await handle.close(); await collected; }
+    },
+  );
   it('bounds Bash retention if rejected Stop leaves no provider terminal', async () => {
     const { handle, stream, events, collected, fakeQuery } = await startSessionWithStream();
     const interrupt = createDeferred<void>();

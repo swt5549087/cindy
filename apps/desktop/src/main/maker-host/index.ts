@@ -157,6 +157,7 @@ import {
   isActiveInputAccountScoped,
   isSessionInTurn,
   canWakeAntigravityTask,
+  canWakeClaudeAfterCommandExit,
   wireSessionToIpc,
   releaseSessionBindingsForOwnerBoundary,
 } from '../maker-ipc/register.js';
@@ -1444,6 +1445,7 @@ export function getMaker(): Maker {
       log: desktopMakerLogger.child('command-gate'),
     });
     const claudeAgent = new ClaudeCodeAgent({
+      canWakeClaudeAfterCommandExit,
       resolveLocalMcpDuplicateChoices,
       toolLifecycleControl: ghostToolLifecycleControl,
       nativeRecoveryObserver: ghostNativeRecoveryObserver,

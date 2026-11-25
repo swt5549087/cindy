@@ -987,9 +987,11 @@ const CAPABILITIES: Capabilities = {
 export class ClaudeCodeAgent extends BaseAgent {
   readonly kind = 'claude-code' as const;
   readonly capabilities: Capabilities;
+  private readonly canWakeAfterCommandExit?: (sessionId: string, instanceId: string) => boolean;
 
-  constructor(deps: AgentDeps) {
+  constructor(deps: AgentDeps & { canWakeClaudeAfterCommandExit?: ClaudeCodeAgent['canWakeAfterCommandExit'] }) {
     super(deps);
+    this.canWakeAfterCommandExit = deps.canWakeClaudeAfterCommandExit;
     this.capabilities = this.buildCapabilities(CAPABILITIES);
   }
 
@@ -4969,19 +4971,70 @@ export class ClaudeCodeAgent extends BaseAgent {
         title?: string;
         outputFile?: string;
         commandKind?: BackgroundCommandKind;
+        bashWakeGeneration?: number;
+        waitingForBashExit?: true;
       }
     >();
     // A Bash notification queues native follow-up even though Bash never owns a
     // product-turn claim. Keep its follow-up visible to idle recyclers through
     // native execution and delivery; do not block send/steer or make Stop kill a running service.
-    // No polling, synthetic turn or replay: absent provider activity expires at
-    // the existing native continuation grace budget, queried on the next gate.
+    // The native reply wins throughout the grace window. Desktop may authorize
+    // one fallback input per explicit send when a real work command exited.
     let pendingBashContinuationUntil = 0;
     let pendingBashContinuationBehindTurn = false;
+    const canWakeAfterBashExit = !reviewMode && !hosted && !opts.remoteHostId
+      ? this.canWakeAfterCommandExit : undefined;
+    const bashWakePermissionBlocked = () =>
+      planTurnActive || sdkInPlanMode || mutablePlanMode || activeTurnPermissionPolicy !== null || activeToolsDisabled;
+    let pendingBashWake = false;
+    let usedBashWake = false;
+    let bashWakeTimer: ReturnType<typeof setTimeout> | undefined;
+    function clearBashWake(): void {
+      pendingBashWake = false;
+      if (bashWakeTimer !== undefined) clearTimeout(bashWakeTimer);
+      bashWakeTimer = undefined;
+    }
+    function scheduleBashWake(): void {
+      if (!pendingBashWake || turnInFlight || bashWakeTimer !== undefined) return;
+      const query = q;
+      bashWakeTimer = setTimeout(() => {
+        clearBashWake();
+        if (closed || q !== query || isAnyProductTurnActive() || controlRequestsBlocked() ||
+          bridgeStateActive() || sendInAcceptPhase || bashWakePermissionBlocked() ||
+          continuationCancellationGeneration !== null || turnState.interruptRequested ||
+          !opts.sessionId || !opts.sessionInstanceId) return;
+        try {
+          if (!canWakeAfterBashExit?.(opts.sessionId, opts.sessionInstanceId)) return;
+          nativeSubscriptionAccount?.assertCurrent();
+          companionEnvironment?.assertCurrent?.();
+          if (!inputQueue.push({
+            type: 'user',
+            message: { role: 'user', content: '[Cindy background command completed] A background command from this task has exited. Check its result and continue any remaining work from the current request.' },
+            parent_tool_use_id: null,
+          })) return;
+          usedBashWake = true;
+          pendingBashContinuationUntil = 0;
+          pendingBashContinuationBehindTurn = false;
+          bashContinuationInFlight = true;
+          beginNewTurn(mutableFastMode ? 'priority' : 'standard');
+          resetToolLoopGuards();
+          turnInFlight = true;
+          eventQueue.push({
+            type: 'status', source: 'claude-code',
+            data: { status: 'Thinking', isRunning: true, providerInitiatedTurn: true },
+          });
+          armUpstreamResponseIdle();
+        } catch {
+          // The account/runtime may have changed during the grace window.
+        }
+      }, WAKE_CONTRACT_GRACE_MS);
+      bashWakeTimer.unref?.();
+    }
     function startPendingBashContinuationGrace(): void {
       if (pendingBashContinuationBehindTurn && !turnInFlight) {
         pendingBashContinuationBehindTurn = false;
         pendingBashContinuationUntil = performance.now() + WAKE_CONTRACT_GRACE_MS;
+        scheduleBashWake();
       }
     }
     const hasPendingBashContinuation = (): boolean => {
@@ -5001,6 +5054,7 @@ export class ClaudeCodeAgent extends BaseAgent {
     let lastExplicitSendGeneration = 0;
     const bashContinuationBoundaries = new Set<AgentEvent>();
     function clearPendingBashContinuations(): void {
+      clearBashWake();
       pendingBashContinuationUntil = 0;
       pendingBashContinuationBehindTurn = false;
       bashContinuationInFlight = false;
@@ -5360,6 +5414,8 @@ export class ClaudeCodeAgent extends BaseAgent {
           outputFile:
             typeof data?.outputFile === 'string' && data.outputFile ? data.outputFile : prev?.outputFile,
           ...(commandKind ? { commandKind } : {}),
+          bashWakeGeneration: prev?.bashWakeGeneration ?? (bashWakePermissionBlocked() ? 0 : lastExplicitSendGeneration),
+          ...(prev?.waitingForBashExit ? { waitingForBashExit: true } : {}),
         });
         const claim = activeContinuationClaim();
         if ((claim?.state === 'awaiting' || claim?.state === 'active') && wake) {
@@ -5378,6 +5434,12 @@ export class ClaudeCodeAgent extends BaseAgent {
           // clears this state, while rejected controls preserve the follow-up.
           pendingBashContinuationBehindTurn = turnInFlight;
           pendingBashContinuationUntil = turnInFlight ? 0 : performance.now() + WAKE_CONTRACT_GRACE_MS;
+          if (!usedBashWake && prev.waitingForBashExit &&
+            prev.bashWakeGeneration === lastExplicitSendGeneration && canWakeAfterBashExit) {
+            clearBashWake();
+            pendingBashWake = true;
+            scheduleBashWake();
+          }
         }
         runningBackgroundTasks.delete(taskId);
         terminalBackgroundTaskIds.add(taskId);
@@ -5823,8 +5885,9 @@ export class ClaudeCodeAgent extends BaseAgent {
     // 每条 SDK message 都通知 watchdog (受 pendingToolIds 守卫不起 timer 那段见上方注释)。
     const registerClaudeSubagentTask = this.deps.registerClaudeSubagentTask;
     const getClaudeSubagentTaskUsage = this.deps.getClaudeSubagentTaskUsage;
-    function completeTranslatedTurnEnd(): void {
+    function completeTranslatedTurnEnd(completedNormally = false): void {
       pendingToolIds.clear();
+      const completedWithRestrictedPermission = bashWakePermissionBlocked();
       const endingHostAutoCompact = hostAutoCompactInFlight;
       hostAutoCompactInFlight = false;
       if (queuedBridgeTurns > 0) {
@@ -5847,6 +5910,16 @@ export class ClaudeCodeAgent extends BaseAgent {
           void q.setPermissionMode(effectiveSdkPermissionMode()).catch((e) => {
             log.warn('plan turn end setPermissionMode failed', { error: String(e) });
           });
+        }
+      }
+      if (!completedNormally || turnState.interruptRequested || completedWithRestrictedPermission) {
+        clearBashWake();
+      } else if (canWakeAfterBashExit && !usedBashWake) {
+        for (const task of runningBackgroundTasks.values()) {
+          if (task.taskType === 'local_bash' && task.commandKind !== 'service' &&
+            task.bashWakeGeneration === lastExplicitSendGeneration && lastExplicitSendGeneration > 0) {
+            task.waitingForBashExit = true;
+          }
         }
       }
       turnInFlight = false;
@@ -6062,6 +6135,7 @@ export class ClaudeCodeAgent extends BaseAgent {
                   (!pendingBashContinuationBehindTurn && hasPendingBashContinuation())) && rawType === 'result')
               )
             ) {
+              clearBashWake();
               const hasPendingBash = hasPendingBashContinuation();
               if (!pendingBashContinuationBehindTurn) {
                 if (hasPendingBash) bashContinuationInFlight = true;
@@ -6138,7 +6212,7 @@ export class ClaudeCodeAgent extends BaseAgent {
                   deferredResumeTurnEnd = true;
                   return;
                 }
-                completeTranslatedTurnEnd();
+                completeTranslatedTurnEnd(rawType === 'result' && rawRecord?.is_error !== true);
               },
               onToolUseStart: (
                 id: string,
@@ -6844,6 +6918,7 @@ export class ClaudeCodeAgent extends BaseAgent {
       },
 
       async send(message: UserMessage, sendOpts?: SendOptions) {
+        clearBashWake();
         // idle resume fallback 正在重建(亚秒窗):等它完成再走正常受理。重建成功时
         // 消息透明跑在新会话上;重建失败/close 竞态时 push 撞上已 end 的队列,由下方
         // userInputAccepted 兜底干净收尾。不抛错 —— 见 idleResumeRebuildGate 声明处。
@@ -7155,6 +7230,8 @@ export class ClaudeCodeAgent extends BaseAgent {
         // 兜底重置 currentTurn —— 上一 turn 异常 / abort 时 endTurn 可能没跑,
         // 防止 currentTurn 残留累加到下一 turn (lastApi / contextWindow / cost 跨 turn 保留)
         beginNewTurn(mutableFastMode ? 'priority' : 'standard');
+        clearBashWake();
+        usedBashWake = false;
         lastExplicitSendGeneration = turnState.generation;
         if (hasPendingBashContinuation()) {
           pendingBashContinuationBehindTurn = true;
@@ -7401,6 +7478,7 @@ export class ClaudeCodeAgent extends BaseAgent {
           // Only confirmed control revokes Bash follow-up; a rejected or
           // no-active Stop must leave its runtime protection intact.
           clearPendingBashContinuations();
+          usedBashWake = true;
           const stoppedClaim = markWakeTasksStopped(fulfilledWakeIds, 'graceful_stop');
           const cancelledContinuation =
             stoppedClaim ?? cancelActiveContinuation('graceful_stop');
@@ -7522,7 +7600,10 @@ export class ClaudeCodeAgent extends BaseAgent {
           // ACK is the existing hard-Stop boundary even when the SDK never
           // drains a result. Release active/queued retention as well as the
           // startup gap, without clearing a newer user generation's state.
-          if (lastExplicitSendGeneration === bashStopGeneration) clearPendingBashContinuations();
+          if (lastExplicitSendGeneration === bashStopGeneration) {
+            clearPendingBashContinuations();
+            usedBashWake = true;
+          }
           // interrupt ACK authorizes retiring only wake tasks whose stop RPC
           // also succeeded. Rejected stops remain tracked for provider events,
           // preserving their continuation contract instead of creating an
@@ -7684,6 +7765,11 @@ export class ClaudeCodeAgent extends BaseAgent {
           ...(info.outputFile ? { outputFile: info.outputFile } : {}),
           ...(info.commandKind ? { backgroundCommandKind: info.commandKind } : {}),
         }));
+      },
+
+      cancelPendingBackgroundWake: () => {
+        clearBashWake();
+        usedBashWake = true;
       },
 
       countPendingWakeContinuations() {

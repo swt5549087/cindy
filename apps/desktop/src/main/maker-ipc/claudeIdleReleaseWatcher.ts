@@ -41,11 +41,13 @@ interface IdleReleaseState {
 
 /** Scope query runs through the DB worker; source and ownership are host facts. */
 const ordinaryTaskSql = (dbAgentKind: 'cc' | 'codex' | 'antigravity') => `SELECT id FROM sessions s
-WHERE s.id = ? AND s.status = 'active' AND s.source = 'desktop'
+WHERE s.id = ? AND s.status = 'active'
+AND ${dbAgentKind === 'antigravity'
+  ? "s.source IN ('desktop', 'bot')"
+  : "s.source = 'desktop' AND NOT EXISTS (SELECT 1 FROM bot_session_links b WHERE b.session_id = s.id)"}
 AND s.hidden_at IS NULL AND s.agent_device_id IS NULL
 AND s.sdk_session_id = ? AND s.sdk_session_id != '<pending>'
 AND s.agent_kind = '${dbAgentKind}' AND s.remote_host_id IS NULL AND s.orca_role IS NULL
-AND NOT EXISTS (SELECT 1 FROM bot_session_links b WHERE b.session_id = s.id)
 AND NOT EXISTS (SELECT 1 FROM orca_workers w WHERE w.session_id = s.id)
 AND NOT EXISTS (SELECT 1 FROM orca_teams t WHERE t.lead_session_id = s.id AND t.status = 'active')
 AND NOT EXISTS (SELECT 1 FROM session_goals g WHERE g.session_id = s.id AND g.status != 'complete')`;

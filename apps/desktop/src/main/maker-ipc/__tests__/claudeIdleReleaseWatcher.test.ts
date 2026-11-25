@@ -197,8 +197,7 @@ describe('ordinary Antigravity idle runtime release', () => {
   });
 });
 
-describe('ordinary task eligibility in SQLite', () => {
-  function database() {
+function eligibilityDatabase() {
     const db = new Database(':memory:');
     db.exec(`
       CREATE TABLE sessions (id TEXT PRIMARY KEY, status TEXT, source TEXT,
@@ -211,9 +210,10 @@ describe('ordinary task eligibility in SQLite', () => {
       INSERT INTO sessions VALUES ('task', 'active', 'desktop', '${makerToDbAgentKind('claude-code')}', NULL, NULL, 'native-history', NULL, NULL);
     `);
     return db;
-  }
+}
+describe('ordinary task eligibility in SQLite', () => {
   it('releases a Claude runtime using the kind written by Desktop persistence', async () => {
-    const db = database();
+    const db = eligibilityDatabase();
     const f = fixture();
     try {
       const eligible = db.prepare(ORDINARY_CLAUDE_TASK_SQL);
@@ -240,7 +240,7 @@ describe('ordinary task eligibility in SQLite', () => {
       status => `INSERT INTO session_goals VALUES ('task', '${status}')`,
     ),
   ])('does not reclaim after %s', (change) => {
-    const db = database();
+    const db = eligibilityDatabase();
     try {
       const eligible = db.prepare(ORDINARY_CLAUDE_TASK_SQL);
       expect(eligible.get('task', 'native-history')).toEqual({ id: 'task' });
@@ -252,7 +252,7 @@ describe('ordinary task eligibility in SQLite', () => {
     "INSERT INTO session_goals VALUES ('task', 'active')",
     "INSERT INTO orca_teams VALUES ('task', 'active')",
   ])('rechecks ownership changed during queue restoration: %s', async change => {
-    const db = database();
+    const db = eligibilityDatabase();
     const f = fixture();
     try {
       const eligible = db.prepare(ORDINARY_CLAUDE_TASK_SQL);
@@ -268,8 +268,8 @@ describe('ordinary task eligibility in SQLite', () => {
   it.each([
     ['codex', ORDINARY_CODEX_TASK_SQL],
     ['antigravity', ORDINARY_ANTIGRAVITY_TASK_SQL],
-  ] as const)('scopes the %s query to ordinary local tasks and preserves task data', (kind, sql) => {
-    const db = database();
+  ] as const)('scopes the %s query to resumable local tasks and preserves task data', (kind, sql) => {
+    const db = eligibilityDatabase();
     try {
       const eligible = db.prepare(sql);
       expect(eligible.readonly).toBe(true);
@@ -281,11 +281,17 @@ describe('ordinary task eligibility in SQLite', () => {
       expect(db.prepare('SELECT status, sdk_session_id FROM sessions WHERE id = ?').get('task'))
         .toEqual({ status: 'active', sdk_session_id: 'native-history' });
       db.exec("INSERT INTO bot_session_links VALUES ('task')");
+      if (kind === 'codex') expect(eligible.get('task', 'native-history')).toBeUndefined();
+      db.exec("UPDATE sessions SET source = 'bot'");
+      if (kind === 'antigravity') {
+        expect(eligible.get('task', 'native-history')).toEqual({ id: 'task' });
+        db.exec("INSERT INTO orca_teams VALUES ('task', 'active')");
+      }
       expect(eligible.get('task', 'native-history')).toBeUndefined();
     } finally { db.close(); }
   });
   it('retains completed goals and other tasks while releasing only a resumable ordinary task', () => {
-    const db = database();
+    const db = eligibilityDatabase();
     try {
       db.exec("INSERT INTO session_goals VALUES ('task', 'complete'); INSERT INTO bot_session_links VALUES ('other')");
       const before = db.prepare('SELECT * FROM sessions').all();
@@ -342,13 +348,18 @@ it.each([
   const first = await maker.createSession(opts);
   if (failFirstClose) vi.mocked(handles[0].close).mockRejectedValueOnce(Error('process still alive'));
   const stored = { ...rows.get('task')! };
+  const partnerDb = agentKind === 'antigravity' ? eligibilityDatabase() : undefined;
+  partnerDb?.exec("UPDATE sessions SET agent_kind = 'antigravity', source = 'bot'; INSERT INTO bot_session_links VALUES ('task')");
+  const partnerEligible = partnerDb?.prepare(ORDINARY_ANTIGRAVITY_TASK_SQL);
   let now = 0;
   const idleMinutes = agentKind === 'antigravity' ? DEFAULT_ANTIGRAVITY_IDLE_RELEASE_MINUTES : 30;
   const watcher = createClaudeIdleReleaseWatcher({
     agentKind,
     listSessions: () => maker.listActiveSessions(), getSession: id => maker.getSession(id),
     readMinutes: () => idleMinutes,
-    isOrdinaryTask: async (id, nativeId) => (await storage.get(id))?.sdkSessionId === nativeId,
+    isOrdinaryTask: async (id, nativeId) => partnerEligible
+      ? Boolean(partnerEligible.get(id, nativeId))
+      : (await storage.get(id))?.sdkSessionId === nativeId,
     hasPendingInput: async () => false, isHostBusy: () => false,
     withLock: async (_id, fn) => fn(),
     close: createIdleReleaseRuntimeClose(maker, suppression.withSuppressed),
@@ -395,6 +406,7 @@ it.each([
     expect(rows.get('task')?.sdkSessionId).toBe('native-history');
   } finally {
     watcher.stop();
+    partnerDb?.close();
     await maker.shutdown();
     suppression.resetForTest();
   }

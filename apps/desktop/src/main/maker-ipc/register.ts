@@ -5025,6 +5025,18 @@ export function canWakeAntigravityTask(sessionId: string, instanceId: string): b
     !sendToSessionLocks.has(sessionId) && !isGoalInputBlocked(sessionId);
 }
 
+export function canWakeClaudeAfterCommandExit(sessionId: string, instanceId: string): boolean {
+  const session = getMakerIfReady()?.getSession(sessionId);
+  const coordinator = agentInputCoordinatorHolder;
+  return session?.agentKind === 'claude-code' && session.instanceId === instanceId &&
+    session.getStatus() === 'active' && !session.hasStartedClosing() && !session.isTurnRunning() &&
+    !session.hasPendingHostOperation() && !isAppSessionBoundaryPending() &&
+    coordinator?.isQueueRestored(sessionId) === true && !hasIdleReleaseQueuedWork(coordinator, sessionId) &&
+    !isSessionTurnPendingCompletion(sessionId) && !sendToSessionLocks.has(sessionId) &&
+    !hasPendingAgentInteractionForSession(sessionId) && pendingCredentialSwitchHolder?.has(sessionId) !== true &&
+    !isGoalInputBlocked(sessionId) && !isSessionSharedTaskActive(sessionId);
+}
+
 export function isSessionInTurn(sessionId: string): boolean {
   return sessionTurnActivityTracker.isSessionInTurn(sessionId);
 }

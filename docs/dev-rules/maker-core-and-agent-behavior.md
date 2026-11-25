@@ -771,6 +771,10 @@ sessionRunningRetry 就停。每次因 replacement 关闭而重新入队都计�
   `useSessionDisplayRunningState` 显示为运行中；任务内状态栏写「正在后台工作」，只剩 `service`
   时写「后台服务运行中」且不再呼吸。回合边界、完成提醒、发送与排队、停止语义都不变——
   `local_bash` 仍不进 `WAKE_BACKGROUND_TASK_TYPES`，用户 Stop 不会杀后台命令。
+- **原生续跑缺失时补唤醒**：本机 Desktop 的 Claude Code 收到已跟踪 `work` 命令的完成或失败事件后，
+  优先等待 SDK 原生续跑。原轮结束、等待窗口届满且宿主确认同一运行实例仍空闲时，才提交一次继续原请求
+  的输入。每次显式发送最多补唤醒一次，新输入、Stop、回退、Query 换代或关闭会撤销候选。长驻服务和
+  缺少可信退出事件的任务不触发补唤醒。
 - **边界**：命令结束到自动续跑那一轮开始之间保留 5 秒，列表不会先闪成已结束；续跑没来到点熄灭，
   关闭任务进程立即熄灭。主进程在任务表变化、回合收尾和回退提交（`maker-orchestration/rewind.ts`，
   关闭旧 Query 时 agent 同步清表）后读 `Session.listBackgroundTasks()`，不靠事件配对（Query 换代
