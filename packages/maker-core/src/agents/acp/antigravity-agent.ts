@@ -71,7 +71,7 @@ interface CommandWake {
   dispatchTimer?: ReturnType<typeof setTimeout>;
 }
 export interface AntigravityHost {
-  connect(cwd: string, opts?: StartSessionOptions): Promise<AntigravityConnection>;
+  connect(cwd: string, opts?: StartSessionOptions, assertCurrent?: () => void): Promise<AntigravityConnection>;
   /** Check the native subscription/credits policy before generation, independently of OAuth. */
   assertGenerationAllowed?(): Promise<void>;
   assertSessionAllowed?(): Promise<void>;
@@ -184,6 +184,45 @@ export class AntigravityAgent extends BaseAgent {
   private nativeModels: AcpDiscoveredModel[] = [];
   constructor(deps: AgentDeps, private host: AntigravityHost) { super(deps); }
   override async getAuthState(): Promise<AuthState> { await this.refreshCachedState(); return { ...this.authState }; }
+  /** Ask the official CLI to check its cached credentials in a fresh, temporary session. */
+  async renewCachedAuthentication(signal: AbortSignal, assertProfile: () => void): Promise<void> {
+    const version = this.connectionVersion;
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      if (this.locallyDisconnected || version !== this.connectionVersion || this.loginSession) {
+        throw new Error('ANTIGRAVITY_CONNECTION_CHANGED');
+      }
+      assertProfile();
+    };
+    assertCurrent();
+    const cwd = globalThis.process.cwd();
+    const connection = await this.host.connect(cwd, undefined, assertCurrent);
+    const assertConnected = () => {
+      assertCurrent();
+      if (connection.isCurrent?.() === false) throw new Error('ANTIGRAVITY_CONNECTION_CHANGED');
+    };
+    const session = new AcpSubscriptionSession({
+      ...connection, cwd, onUpdate() {}, requestPermission: async () => false,
+      assertSubscriptionOnly: async () => {
+        await connection.assertSubscriptionOnly();
+        assertConnected();
+      },
+    });
+    let closing: Promise<void> | undefined;
+    const close = () => closing ??= session.close();
+    const onAbort = () => { void close().catch(() => {}); };
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      assertConnected();
+      await session.initialize();
+      assertConnected();
+      await session.open({ cachedAuthentication: true });
+      assertConnected();
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+      try { await close(); } finally { connection.dispose?.(); }
+    }
+  }
   /** A profile change discards auth/model state and fences work from the prior connection. */
   resetConnection(): void {
     this.cancelLogin();

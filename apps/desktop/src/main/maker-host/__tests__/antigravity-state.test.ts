@@ -8,7 +8,7 @@ import { buildAntigravityAgent, getAntigravityAccounts } from '../antigravity-ho
 import { createMakerLogger } from '../logger-adapter';
 import { createAntigravityUsageReader, parseAntigravityQuota } from '../antigravity-usage';
 import { antigravityProvider, setAntigravityState } from '../antigravity-state';
-import { ANTIGRAVITY_ACCOUNT_BUSY } from '../../../shared/antigravityAccounts';
+import { ANTIGRAVITY_ACCOUNT_BUSY, summarizeAntigravityQuota } from '../../../shared/antigravityAccounts';
 import { supportsAntigravityRuntime } from '../antigravity-runtime';
 
 afterEach(() => setAntigravityState(null));
@@ -50,6 +50,35 @@ describe('native Google subscription metadata', () => {
 // Unit: Google omits zero and sometimes labels a bucket by text. The catalog
 // tests above cannot catch a spent subscription being displayed as available.
 describe('Google quota projection', () => {
+  // Unit regression for the Windows tray showing a dash after an idle CLI.
+  // Existing valid-token coverage never exercised two refreshes on an expired profile.
+  it.each([-1, 60_000])('renews a token with %i ms remaining once for concurrent readers', async (remainingMs) => {
+    vi.useFakeTimers();
+    const directory = mkdtempSync(join(tmpdir(), 'cindy-test-google-renewal-'));
+    const tokenPath = join(directory, 'antigravity-oauth-token');
+    const writeToken = (remaining: number) => writeFileSync(tokenPath, JSON.stringify({
+      token: { access_token: 'fixture-access', expiry: new Date(Date.now() + remaining).toISOString() },
+    }), { mode: 0o600 });
+    try {
+      writeToken(remainingMs);
+      const renew = vi.fn(async () => { writeToken(600_000); });
+      const fetcher = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(Response.json({ cloudaicompanionProject: 'test-project' }))
+        .mockResolvedValueOnce(Response.json({ groups: [{ buckets: [{ window: 'weekly', remainingFraction: 0.75 }] }] }));
+      const read = createAntigravityUsageReader(fetcher, { renew });
+      const signal = new AbortController().signal;
+      const latest = await Promise.all([read(tokenPath, 1, signal, () => {}), read(tokenPath, 1, signal, () => {})]);
+      expect(latest).toMatchObject([
+        [{ secondary: { usedPercent: 25 } }],
+        [{ secondary: { usedPercent: 25 } }],
+      ]);
+      expect(renew).toHaveBeenCalledTimes(1);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
   it('preserves model-group windows and treats an omitted spent fraction as zero remaining', () => {
     const timestamp = '2026-11-18T10:00:00Z';
     const result = parseAntigravityQuota({ groups: [
@@ -93,10 +122,106 @@ describe('Google quota projection', () => {
       expect(second).toEqual(first);
       expect(fetcher).toHaveBeenNthCalledWith(2,
         'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary',
-        expect.objectContaining({ body: JSON.stringify({ project: 'test-project' }) }));
+        expect.objectContaining({ body: JSON.stringify({ project: 'test-project' }) }),
+        expect.any(Function));
       await expect(read(tokenPath, 2, signal, scope)).resolves.toEqual([]);
       expect(fetcher).toHaveBeenCalledTimes(3);
     } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  // Unit: the tray lost last-good values on a single failed request. A 429, malformed
+  // response or thrown transport error must not erase a still-live window or leak detail.
+  it('keeps only still-live history and retries with scrubbed diagnostics', async () => {
+    vi.useFakeTimers();
+    const directory = mkdtempSync(join(tmpdir(), 'cindy-test-google-fallback-'));
+    const tokenPath = join(directory, 'antigravity-oauth-token');
+    const now = Date.now();
+    try {
+      writeFileSync(tokenPath, JSON.stringify({
+        token: { access_token: 'secret-access', expiry: new Date(now + 3_600_000).toISOString() },
+      }), { mode: 0o600 });
+      const project = () => Response.json({ cloudaicompanionProject: 'secret-project' });
+      const quota = () => Response.json({ groups: [{ displayName: 'Gemini Models', buckets: [
+        { window: 'session', remainingFraction: 0.5, resetTime: new Date(now + 182_000).toISOString() },
+      ] }, { displayName: 'Claude Models', buckets: [
+        { window: 'weekly', remainingFraction: 0.75, resetTime: new Date(now + 3_600_000).toISOString() },
+      ] }] });
+      const fetcher = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(project()).mockResolvedValueOnce(quota())
+        .mockRejectedValueOnce(new Error('proxy contains secret-proxy'))
+        .mockResolvedValueOnce(project()).mockResolvedValueOnce(new Response('secret-response', { status: 429, headers: { 'retry-after': '20' } }))
+        .mockResolvedValueOnce(project()).mockResolvedValueOnce(Response.json({ secret: 'secret-response' }))
+        .mockResolvedValueOnce(project()).mockResolvedValueOnce(quota());
+      const report = vi.fn();
+      const read = createAntigravityUsageReader(fetcher, { report });
+      const signal = new AbortController().signal;
+      const refresh = (scope = 1) => read(tokenPath, scope, signal, () => {});
+      expect((await refresh())[0]).toMatchObject({ primary: { usedPercent: 50 }, updatedAt: now });
+      vi.setSystemTime(now + 183_000);
+      const retained = [
+        { limitName: 'Gemini Models', primary: null, secondary: null, updatedAt: now },
+        { limitName: 'Claude Models', secondary: { usedPercent: 25 }, updatedAt: now },
+      ];
+      const stale = await refresh();
+      expect(stale).toMatchObject(retained);
+      expect(summarizeAntigravityQuota(stale, Date.now())).toEqual({ primary: null, secondary: null });
+      expect(await refresh()).toMatchObject(retained);
+      expect(fetcher).toHaveBeenCalledTimes(3);
+      vi.setSystemTime(now + 198_000);
+      expect(await refresh()).toMatchObject(retained);
+      vi.setSystemTime(now + 213_000);
+      expect(await refresh()).toMatchObject(retained);
+      expect(fetcher).toHaveBeenCalledTimes(5);
+      vi.setSystemTime(now + 218_000);
+      expect(await refresh()).toMatchObject(retained);
+      vi.setSystemTime(now + 233_000);
+      expect((await refresh())[1]).toMatchObject({ secondary: { usedPercent: 25 }, updatedAt: now + 233_000 });
+      expect(report.mock.calls).toEqual([
+        [{ reason: 'network-or-proxy', stage: 'load-project' }],
+        [{ reason: 'http', stage: 'read-quota', status: 429 }],
+        [{ reason: 'missing-fields', stage: 'read-quota' }],
+      ]);
+      fetcher.mockRejectedValueOnce(new Error('offline'));
+      expect(await refresh(2)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  // Unit: repeated refreshes while the CLI cannot renew must not launch more
+  // processes before the cooldown, and a failed CLI error may contain secrets.
+  it('backs off unsuccessful renewal independently from the short quota retry', async () => {
+    vi.useFakeTimers();
+    const directory = mkdtempSync(join(tmpdir(), 'cindy-test-google-backoff-'));
+    const tokenPath = join(directory, 'antigravity-oauth-token');
+    const now = Date.now();
+    try {
+      writeFileSync(tokenPath, JSON.stringify({
+        token: { access_token: 'secret-access', expiry: new Date(now - 1).toISOString() },
+      }), { mode: 0o600 });
+      const renew = vi.fn().mockRejectedValueOnce(new Error('secret-cli-error')).mockResolvedValueOnce(undefined);
+      const fetcher = vi.fn<typeof fetch>();
+      const report = vi.fn();
+      const read = createAntigravityUsageReader(fetcher, { renew, report });
+      const signal = new AbortController().signal;
+      const refresh = () => read(tokenPath, 1, signal, () => {});
+      expect(await refresh()).toEqual([]);
+      vi.setSystemTime(now + 15_000);
+      expect(await refresh()).toEqual([]);
+      expect(renew).toHaveBeenCalledTimes(1);
+      vi.setSystemTime(now + 30_000);
+      expect(await refresh()).toEqual([]);
+      expect(renew).toHaveBeenCalledTimes(2);
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(report.mock.calls).toEqual([
+        [{ reason: 'token-expiring' }], [{ reason: 'renewal-failed' }],
+        [{ reason: 'token-expiring' }], [{ reason: 'token-not-renewed' }],
+      ]);
+    } finally {
+      vi.useRealTimers();
       rmSync(directory, { recursive: true, force: true });
     }
   });

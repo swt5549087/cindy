@@ -168,8 +168,30 @@ describe('AntigravityAgent native Cindy contract', () => {
     await agent.getAuthState();
     expect(connect).toHaveBeenCalledTimes(1);
     expect(agent.capabilities.availableModels.map(m => m.id)).toEqual(['gemini-test']);
+    // Unit regression: the tray detected a stale on-disk token after this successful
+    // startup probe. Renewal must use a fresh cached-auth ACP session even then.
+    h.sent.length = 0;
+    await agent.renewCachedAuthentication(new AbortController().signal, () => {});
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(h.sent.map(x => x.method)).toEqual(['initialize', 'session/new', 'session/set_mode']);
     expect(h.sent.some(x => x.method === 'authenticate' || x.method === 'session/prompt')).toBe(false);
-    await agent.logout(); await agent.getAuthState(); expect(connect).toHaveBeenCalledTimes(1);
+    await agent.logout(); await agent.getAuthState(); expect(connect).toHaveBeenCalledTimes(2);
+  });
+  // Unit: a profile change while the temporary native session opens must close
+  // that transport immediately. Existing task and browser auth tests use other sessions.
+  it('closes a pending cached-auth renewal when its profile is invalidated', async () => {
+    const h = setup();
+    await h.session.close();
+    const controller = new AbortController();
+    const write = h.transport.write.bind(h.transport);
+    const close = vi.spyOn(h.transport, 'close');
+    h.transport.write = line => {
+      if (JSON.parse(line).method === 'session/new') controller.abort();
+      else write(line);
+    };
+    const { agent } = makeAgent(h);
+    await expect(agent.renewCachedAuthentication(controller.signal, () => {})).rejects.toThrow();
+    expect(close).toHaveBeenCalledTimes(1);
   });
   it.each([
     ['ask', false, 'default'], ['auto', false, 'auto'], ['acceptEdits', false, 'accept-edits'],

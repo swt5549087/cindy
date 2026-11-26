@@ -204,12 +204,12 @@ function createAntigravityAgent(
   const assertCurrentBinding = (binding: Binding): void => {
     if (!isCurrentBinding(binding)) throw new Error('ANTIGRAVITY_CONNECTION_CHANGED');
   };
-  const checkPolicy = (binding: Binding): void => {
+  const checkPolicy = (binding: Binding, initializeSettings = true): void => {
     assertCurrentBinding(binding);
     const geminiDir = geminiHome(binding.id);
     const settingsPath = path.join(geminiDir, 'antigravity-cli', 'settings.json');
-    ownerDirectory(path.dirname(settingsPath), true);
-    if (!fs.existsSync(settingsPath)) {
+    ownerDirectory(path.dirname(settingsPath), initializeSettings);
+    if (initializeSettings && !fs.existsSync(settingsPath)) {
       fs.writeFileSync(settingsPath, JSON.stringify({ useG1Credits: false, modelProvider: '', agentMode: '', toolPermission: 'strict' }), { mode: 0o600, flag: 'wx' });
     }
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
@@ -233,20 +233,22 @@ function createAntigravityAgent(
     logger, runtimeConfig: {},
     auth: { getState: async () => ({ authenticated: false }), triggerLogin: async () => ({ authenticated: false }), logout: async () => {}, getAuthEnv: async () => ({}) },
   }, {
-    async connect(cwd, opts) {
+    async connect(cwd, opts, assertQuotaBinding) {
       assertAccountIdle();
+      assertQuotaBinding?.();
       const binding = getBinding();
       const stableSession = opts !== undefined;
       const sessionScope = binding.id === LEGACY_PROFILE ? '' : `antigravity-profile:${binding.id}:`;
       assertVerifiedAntigravityBinary(binding.binary);
       if (stableSession) assertProfileIdentity(binding.config, binding.id);
-      checkPolicy(binding);
+      checkPolicy(binding, !assertQuotaBinding);
       const tools = opts && prepareTools ? await prepareTools(opts) : undefined;
       try {
         const httpsProxy = await resolveAntigravityHttpsProxy();
         // MCP and proxy preparation yield. Recheck the owner and profile before spawning.
         assertAccountIdle();
-        checkPolicy(binding);
+        assertQuotaBinding?.();
+        checkPolicy(binding, !assertQuotaBinding);
         if (stableSession) assertProfileIdentity(readConnection(), binding.id);
         assertVerifiedAntigravityBinary(binding.binary);
         const transport = spawnAcp(binding.binary, antigravitySubscriptionArgs(geminiHome(binding.id), opts?.permissionMode, !!tools?.mcpServers.length),
@@ -278,7 +280,7 @@ function createAntigravityAgent(
           canWakeAfterCommandExit: sessionId && sessionInstanceId && canWakeTaskSession
             ? () => canWakeTaskSession(sessionId, sessionInstanceId)
             : undefined,
-          assertSubscriptionOnly: async () => checkPolicy(binding),
+          assertSubscriptionOnly: async () => checkPolicy(binding, !assertQuotaBinding),
           assertGenerationAllowed: async () => {
             assertCurrentBinding(binding);
             const current = readConnection();
@@ -315,7 +317,11 @@ function createAntigravityAgent(
       assertAccountIdle();
       const { config, id } = getBinding();
       writeConnection(setDisconnected(config, id, true));
+      for (const request of quotaReads) request.abort();
+      lastUsage = null;
+      version += 1;
       clearState();
+      notifyAntigravityQuotaChanged();
     },
     modelsChanged(models, tier, capabilities) {
       assertOwner();
@@ -457,7 +463,13 @@ function createAntigravityAgent(
       ...(profiles.length === 0 ? { disconnectedProfiles: [id] } : {}),
     });
   };
-  const readUsage = createAntigravityUsageReader(outboundFetch);
+  const readUsage = createAntigravityUsageReader(outboundFetch, {
+    renew: (signal, assertCurrent) => agent.renewCachedAuthentication(signal, assertCurrent),
+    report: diagnostic => {
+      if (diagnostic.reason === 'token-expiring') logger.debug('Antigravity quota token needs renewal', diagnostic);
+      else logger.warn('Antigravity quota read unavailable', diagnostic);
+    },
+  });
   currentAccounts = {
     read, assertOwner,
     assertActiveAccount(id) {
@@ -581,6 +593,7 @@ function createAntigravityAgent(
       const release = onAppSessionInvalidated(() => request.abort());
       try {
         const usage = await readUsage(token, binding.version, request.signal, () => {
+          assertAccountIdle();
           assertCurrentBinding(binding);
           const current = readConnection();
           if (disconnected(current, id)) throw new Error('ANTIGRAVITY_CONNECTION_CHANGED');
