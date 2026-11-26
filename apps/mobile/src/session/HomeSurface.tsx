@@ -49,7 +49,6 @@ import {
   type NativeScrollEvent,
   type NativeSyntheticEvent,
   Pressable,
-  RefreshControl,
   ScrollView,
   SectionList,
   StyleSheet,
@@ -190,7 +189,8 @@ import {
 } from '@/device-link/remoteStatus';
 import { useLocalNetworkStatus } from '@/device-link/localNetworkStatus';
 import { withTransientRemoteRetry } from '@/device-link/remoteRetry';
-import { ConnectionRecoveryProgress } from '@/components/ConnectionBanner';
+import { ConnectionRecoveryProgress, ConnectionRejoinButton } from '@/components/ConnectionBanner';
+import { useMobileDeviceRejoin } from '@/device-link/deviceRejoin';
 import { ConnectionNoticeOverlay, useDelayedConnectionNotice } from '@/components/ConnectionNoticeOverlay';
 import { resolveConnectionBannerVisibility, resolveConnectionBannerSyncActionVisibility, resolveHomeConnectionFeedback, resolveHomeDeviceDisconnected, type HomeConnectionError, type HomeDeviceFailure } from '@/components/connectionBannerVisibility';
 import { QuietSyncIndicator } from '@/components/QuietSyncIndicator';
@@ -343,6 +343,7 @@ import { useTheme, useThemedStyles, type ThemeColors } from '@/theme';
 import { fontWeight, iconSize, iconStroke, lineHeight, motionDuration, navigationChrome, radius, spacing, typeScale } from '@/theme/tokens';
 import { mobileInteractionStyles } from '@/components/mobileInteractionStyles';
 import { useReduceMotionEnabled } from '@/hooks/useReduceMotion';
+import { HomePullRefreshControl } from './HomePullRefreshControl';
 
 const LIST_LIMIT = 200;
 // Keep the device-link channel responsive while All Sessions hydrates several
@@ -1516,7 +1517,7 @@ function HomeScreenContent({ active = true, width, newSessionInSystemBar = false
   const refreshHome = useCallback(() => {
     const owner = accountGeneration;
     const scope = displayOrderScopeRef.current;
-    void loadHome({ visible: true }).then(async () => {
+    const completion = loadHome({ visible: true }).then(async () => {
       // A refresh queued behind startup must wait for that queued batch too.
       while (syncInFlightRef.current) await syncInFlightRef.current;
       if (homeAccountGenerationRef.current !== owner || displayOrderScopeRef.current !== scope) return;
@@ -1525,10 +1526,12 @@ function HomeScreenContent({ active = true, width, newSessionInSystemBar = false
       await reloadHostProjectOrderRef.current?.();
       if (homeAccountGenerationRef.current === owner && displayOrderScopeRef.current === scope) resetDisplayOrder();
     });
-    if (!homeRoster) return;
-    void homeRoster.roster.refresh();
-    if (homeRoster.groups.supported) void homeRoster.groups.refresh();
-    setTeammatesRefreshKey(key => key + 1);
+    if (homeRoster) {
+      void homeRoster.roster.refresh();
+      if (homeRoster.groups.supported) void homeRoster.groups.refresh();
+      setTeammatesRefreshKey(key => key + 1);
+    }
+    return completion;
   }, [accountGeneration, homeRoster, loadHome, resetDisplayOrder]);
   loadHomeRef.current = loadHome;
 
@@ -2622,6 +2625,8 @@ function HomeScreenContent({ active = true, width, newSessionInSystemBar = false
   const activeConnectionIssue = status !== 'online' || connectionIssue?.kind === 'unstable' ? connectionIssue : null;
   const network = useLocalNetworkStatus();
   const networkUnavailable = network === 'unavailable';
+  // This phone was removed on the official network: the row offers 「重新加入」 instead of a resync.
+  const homeRejoin = useMobileDeviceRejoin(networkUnavailable ? null : activeConnectionIssue);
   // Cached rows and failed hydration are not proof that a computer is offline.
   // Use this relay generation's authoritative presence; unknown stays neutral.
   const selectedDeviceDisconnected = status === 'online'
@@ -3517,9 +3522,8 @@ function HomeScreenContent({ active = true, width, newSessionInSystemBar = false
         updateCellsBatchingPeriod={32}
         windowSize={HOME_LIST_WINDOW_SIZE}
         refreshControl={
-          <RefreshControl
+          <HomePullRefreshControl
             progressViewOffset={residentList.enabled ? 0 : chromeHeight}
-            refreshing={refreshing}
             onRefresh={refreshHome}
             tintColor={colors.textSecondary}
           />
@@ -3839,7 +3843,9 @@ function HomeScreenContent({ active = true, width, newSessionInSystemBar = false
           <Text ellipsizeMode="tail" numberOfLines={1} style={styles.connectionText} testID="connection.title">
             {connectionCopy ? `${connectionTitle} · ${connectionCopy}` : connectionTitle}
           </Text>
-          {showHomeSyncAction ? <Pressable
+          {homeRejoin.visible ? (
+            <ConnectionRejoinButton busy={homeRejoin.busy} onPress={homeRejoin.run} />
+          ) : showHomeSyncAction ? <Pressable
             accessibilityLabel={refreshing ? t('devices.list.a11y.syncing') : t('devices.list.a11y.sync')}
             accessibilityRole="button"
             accessibilityState={{ busy: refreshing || undefined, disabled: refreshing }}

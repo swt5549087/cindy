@@ -134,7 +134,7 @@ export interface MenubarDetail {
 export interface MenubarTask {
   sessionId: string;
   title: string;
-  harness: 'claude-code' | 'codex' | 'pi' | 'antigravity';
+  harness: 'claude-code' | 'codex' | 'pi' | 'antigravity' | 'acp';
   logoSvg: string;
   /** Estimated value today, in the ledger currency. */
   value: number;
@@ -150,7 +150,7 @@ export interface MenubarTask {
 
 export interface MenubarModelUsage {
   name: string;
-  harness: 'claude-code' | 'codex' | 'pi' | 'antigravity';
+  harness: MenubarTask['harness'];
   money: number;
   tokens: number;
 }

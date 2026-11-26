@@ -77,6 +77,7 @@ import {
   formatBotListTimestamp,
 } from './botListDisplay';
 import { botDeviceLabel, partitionBotRoster } from './botRosterDisplay';
+import { botOpenRoute } from './botNavigation';
 import { readCollapsedTeammateAvatars, writeCollapsedTeammateAvatars, readTeammatesViewMode, writeTeammatesViewMode, type TeammatesViewMode, readTeammatesSectionCollapsed, writeTeammatesSectionCollapsed } from './teammatesSectionPrefs';
 import {
   BotModelSelectionRequiredError,
@@ -652,6 +653,16 @@ export function TeammatesSection() {
     const bot = entry.bot;
     return 'deviceId' in bot ? `/bots/remote/${encodeURIComponent(bot.deviceId)}/${encodeURIComponent(bot.id)}` : `/bots/${encodeURIComponent(bot.id)}`;
   };
+  const openChat = (entry: (typeof visibleChats)[number]) => {
+    if (entry.kind === 'bot' && !('deviceId' in entry.bot)) {
+      const { to, state } = botOpenRoute(entry.bot);
+      if (state) navigate(to, { state });
+      else navigate(to);
+      return;
+    }
+    const route = chatRoute(entry);
+    if (route) navigate(route);
+  };
 
   const renderChatRow = (entry: (typeof visibleChats)[number]) => {
     if (entry.kind === 'group') return renderGroupRow(entry.group);
@@ -792,7 +803,7 @@ export function TeammatesSection() {
         <button
           type="button"
           {...companionDragProps(chatRoute(entry), bot.name)}
-          onClick={() => navigate(chatRoute(entry)!)}
+          onClick={() => openChat(entry)}
           aria-current={selected ? 'page' : undefined}
           onContextMenu={(event) => {
             event.preventDefault();
@@ -1001,7 +1012,7 @@ export function TeammatesSection() {
                     <button
                       type="button"
                       {...companionDragProps(chatRoute(entry), label)}
-                      onClick={() => { const route = chatRoute(entry); if (route) navigate(route); }}
+                      onClick={() => openChat(entry)}
                       aria-label={label}
                       aria-current={selected ? 'page' : undefined}
                       className="relative isolate flex h-10 w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -1149,14 +1160,18 @@ export function TeammatesSection() {
                         >
                           <Eye size={14} />
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => setDeleteTarget(bot)}
-                          className="mr-1 flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-danger)] hover:bg-[var(--danger-bg-soft)]"
-                          aria-label={t('bots.lifecycle.deleteTitle')}
-                        >
-                          <Trash2 size={14} />
-                        </button>
+                        <Tip text={t('bots.lifecycle.deleteTitle')}>
+                          <Button
+                            variant="secondary"
+                            tone="danger"
+                            size="sm"
+                            onClick={() => setDeleteTarget(bot)}
+                            className="mr-1 w-7 px-0"
+                            aria-label={t('bots.lifecycle.deleteTitle')}
+                          >
+                            <Trash2 size={14} aria-hidden />
+                          </Button>
+                        </Tip>
                       </div>
                     ))
                   : null}
@@ -1193,14 +1208,18 @@ export function TeammatesSection() {
                           {botRosterLabel(bot, bots)}
                         </span>
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => setDeleteTarget(bot)}
-                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[var(--text-danger)] opacity-0 hover:bg-[var(--danger-bg-soft)] group-hover:opacity-100 focus:opacity-100"
-                        aria-label={t('bots.lifecycle.deleteTitle')}
-                      >
-                        <Trash2 size={14} />
-                      </button>
+                      <Tip text={t('bots.lifecycle.deleteTitle')}>
+                        <Button
+                          variant="secondary"
+                          tone="danger"
+                          size="sm"
+                          onClick={() => setDeleteTarget(bot)}
+                          className="w-7 px-0 opacity-0 group-hover:opacity-100 focus:opacity-100"
+                          aria-label={t('bots.lifecycle.deleteTitle')}
+                        >
+                          <Trash2 size={14} aria-hidden />
+                        </Button>
+                      </Tip>
                     </div>
                   );
                 })}

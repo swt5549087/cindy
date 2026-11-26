@@ -52,6 +52,10 @@ import { localCliDisplayName, type LocalCliDetection } from '../../../shared/loc
 import { useProviderOAuthDeviceCode } from '@/hooks/useProviderOAuthDeviceCode';
 import { isSubscriptionProvider } from '../../../shared/subscriptionAccounts';
 import { SubscriptionSignInChoices, type SubscriptionSignInTarget } from './SubscriptionSignInChoices';
+import { getDataOwnerGeneration, isDataOwnerGenerationCurrent } from '@/contexts/dataOwnerGeneration';
+import type { OfficialModelPlugin } from '../../../shared/pluginMarket';
+import { OfficialModelPluginStep } from './OfficialModelPluginStep';
+import { useOfficialModelPlugins } from './useOfficialModelPlugins';
 import { cardIcon, ProviderRow } from './ProviderRow';
 import { LocalOllamaInstall, offersManagedOllamaInstall } from './LocalOllamaInstall';
 import { MANAGED_LLAMACPP_PROVIDER_ID } from '../../../shared/llamaCpp';
@@ -60,6 +64,7 @@ import { SettingsTextInput } from './SettingsTextInput';
 import { modelsAfterProviderEndpointEdit } from '@/lib/customProviderEndpointEdit';
 import type { DetectedProviderDraft } from '../../../shared/providerDetection';
 import { SpeechModelChoices } from './SpeechModelChoices';
+import { isRealtimeModel } from '../../../shared/speechProviderSetup';
 import { isSpeechModel, SPEECH_API_PRESETS, speechReferenceModels, speechSetupTarget, withSpeechApiPresets } from '../../../shared/speechProviderSetup';
 
 import {
@@ -93,6 +98,7 @@ interface AddProviderWizardProps {
   onReturnCustom?: (draft: DetectedProviderDraft) => void;
   providers: ProviderView[];
   entry?: WizardEntry;
+  showOfficialModelPlugins?: boolean;
   /** 连接失败已在向导内提示；父级只恢复草稿，不再提示目录目标失效。 */
   onEntryUnavailable?: (reason?: 'target-unavailable' | 'connection-failed') => void;
   /** 「自定义端点」卡片 → 关闭向导并打开完整表单。 */
@@ -312,6 +318,7 @@ export function AddProviderWizard({
   providers,
   entry,
   onEntryUnavailable,
+  showOfficialModelPlugins,
   onOpenCustomForm: openCustomForm,
   onOpenAntigravity,
   onClose: notifyClosed,
@@ -338,6 +345,7 @@ export function AddProviderWizard({
   const consumePresetEntry = useCallback(() => {
     if (entry?.kind === 'preset') presetEntryConsumedRef.current = entry.presetId;
   }, [entry]);
+  const [pluginStep, setPluginStep] = useState<{ item: OfficialModelPlugin; owner: ReturnType<typeof getDataOwnerGeneration> }>();
   const [query, setQuery] = useState('');
   // entry(左栏检测建议 / 引导卡直达):目录里找得到该渠道才直达授权步,否则回落目录页。
   const entryProvider =
@@ -416,6 +424,7 @@ export function AddProviderWizard({
         recommended: boolean;
         speechReference?: boolean;
         manualSpeech?: boolean;
+        realtime?: boolean;
         agents: AgentKind[];
         /** 列模型端点上报的上下文窗口,**按 agent 分槽**(同一 id 双端可不同,如
          *  cc=1M / codex=272K);完成创建时按所属 runtime 取值,作为供应商事实单独保存。 */
@@ -513,6 +522,10 @@ export function AddProviderWizard({
     [presets],
   );
   const q = query.trim().toLowerCase();
+  const activePluginStep = pluginStep && isDataOwnerGenerationCurrent(pluginStep.owner) ? pluginStep : undefined;
+  const officialPlugins = useOfficialModelPlugins(step === 1 && !activePluginStep && !!showOfficialModelPlugins, i18n.language);
+  const matchingPlugins = officialPlugins.items.filter(item =>
+    !q || [item.name, item.ghostId, item.description].some(value => value?.toLowerCase().includes(q)));
   const filteredOauth = q
     ? oauthChoices.filter((p) => p.name.toLowerCase().includes(q))
     : oauthChoices;
@@ -972,6 +985,8 @@ export function AddProviderWizard({
 
     for (const agent of agents) {
       for (const m of preset.runtimes[agent]?.models ?? []) {
+        // A realtime preset describes capabilities. Only discovery adds account membership.
+        if (isRealtimeModel(m, modelRegistry)) continue;
         const existing = initial.get(m.id);
         if (existing) {
           if (!existing.agents.includes(agent)) existing.agents.push(agent);
@@ -1004,6 +1019,7 @@ export function AddProviderWizard({
       if (runtime.requestPath) continue;
       const baseUrl = presetRuntimeBaseUrl(preset, agent, presetBaseUrls);
       for (const model of presetSupplementalModels(preset, agent, modelRegistry, baseUrl)) {
+        if (isRealtimeModel(model, modelRegistry)) continue;
         const existing = initial.get(model.id);
         if (existing) {
           if (!existing.agents.includes(agent)) existing.agents.push(agent);
@@ -1041,6 +1057,7 @@ export function AddProviderWizard({
           discoveredSources: { ...existing?.discoveredSources, [agent]: m.discoveredSource },
           discoverySnapshotIds: { ...existing?.discoverySnapshotIds, [agent]: m.discoverySnapshotId },
           opaqueModelIds: { ...existing?.opaqueModelIds, [agent]: m.opaqueModelId },
+          ...(m.discoveredCost ? { discoveredCosts: { ...existing?.discoveredCosts, [agent]: m.discoveredCost } } : {}),
           ...(m.route ? { routes: { ...existing?.routes, [agent]: m.route } } : {}),
         });
       }
@@ -1218,9 +1235,13 @@ export function AddProviderWizard({
               existing.name !== m.name ||
               m.discoveredSource || m.discoverySnapshotId || m.opaqueModelId ||
               existing.discoveredSources?.[agent] || existing.discoverySnapshotIds?.[agent] ||
-              m.discoveredCost ||
+              m.discoveredCost || existing.discoveredCosts?.[agent] ||
               m.discoveredMetadata || existing.speechReference
             ) {
+              const nextDiscoveredCosts = { ...existing.discoveredCosts };
+              if (m.discoveredCost) nextDiscoveredCosts[agent] = m.discoveredCost;
+              else delete nextDiscoveredCosts[agent];
+              const hasDiscoveredCosts = Object.keys(nextDiscoveredCosts).length > 0;
               next.set(m.id, {
                 ...existing,
                 speechReference: false,
@@ -1231,7 +1252,7 @@ export function AddProviderWizard({
                 discoveredSources: { ...existing.discoveredSources, [agent]: m.discoveredSource },
                 discoverySnapshotIds: { ...existing.discoverySnapshotIds, [agent]: m.discoverySnapshotId },
                 opaqueModelIds: { ...existing.opaqueModelIds, [agent]: m.opaqueModelId || existing.opaqueModelIds?.[agent] },
-                ...(m.discoveredCost ? { discoveredCosts: { ...existing.discoveredCosts, [agent]: m.discoveredCost } } : {}),
+                discoveredCosts: hasDiscoveredCosts ? nextDiscoveredCosts : undefined,
                 agents: mergedAgents,
                 discoveredMetadata: {
                   ...existing.discoveredMetadata,
@@ -1374,6 +1395,7 @@ export function AddProviderWizard({
         routes: v.routes,
         interfaceIds: v.interfaceIds,
         manualSpeech: v.manualSpeech,
+        realtime: v.realtime,
       }));
     if (!bindGeminiImages && !selected.some(model => model.checked)) {
       toast.error(t('settings.providers.wizard.noModelSelected'));
@@ -1412,7 +1434,7 @@ export function AddProviderWizard({
             const discoveredMetadata = m.discoveredMetadata?.[agent] ?? {};
             // Current picks own visibility; an old disabled draft must not override
             // a checked row. Leave checked models on the existing default contract.
-            const { defaultEnabled: _oldEnabled, ...draftModel }: Partial<ProviderRuntimeModelConfig> =
+            const { defaultEnabled: _oldEnabled, discoveredCost: _oldCost, ...draftModel }: Partial<ProviderRuntimeModelConfig> =
               detected?.config.runtimes[agent]?.models.find(model => model.id === m.id) ?? {};
             return {
               ...draftModel,
@@ -1429,7 +1451,7 @@ export function AddProviderWizard({
               discoverySnapshotId: m.discoverySnapshotIds?.[agent],
               opaqueModelId: m.opaqueModelIds?.[agent],
               ...(m.discoveredCosts?.[agent] ? { discoveredCost: m.discoveredCosts[agent] } : {}),
-              ...(m.manualSpeech ? { mode: 'audio_speech' as const } : presetModel?.mode ? { mode: presetModel.mode } : {}),
+              ...(m.realtime ? { mode: 'realtime' as const, modalities: { input: ['audio', 'text'], output: ['audio', 'text'] } } : m.manualSpeech ? { mode: 'audio_speech' as const } : presetModel?.mode ? { mode: presetModel.mode } : {}),
               ...(presetModel?.modalities ? { modalities: { input: [...presetModel.modalities.input], output: [...presetModel.modalities.output] } } : {}),
               ...(presetModel?.officialDocs ? { officialDocs: presetModel.officialDocs } : {}),
               // Known models follow the maintained preset after refresh. Only
@@ -1525,7 +1547,10 @@ export function AddProviderWizard({
   const speechPicks = [...picks.entries()].filter(([id, value]) => value.manualSpeech || value.agents.some(agent =>
     isSpeechModel({ id, discoveredMetadata: value.discoveredMetadata?.[agent], mode: sel?.kind === 'preset' ? sel.preset.runtimes[agent]?.models.find(model => model.id === id)?.mode : undefined })));
   const speechIds = new Set(speechPicks.map(([id]) => id));
-  const generalPicks = [...picks.entries()].filter(([id]) => !speechIds.has(id));
+  const realtimePicks = [...picks.entries()].filter(([id, value]) => value.realtime || value.agents.some(agent =>
+    isRealtimeModel({ id, discoveredMetadata: value.discoveredMetadata?.[agent] }, modelRegistry)));
+  const realtimeIds = new Set(realtimePicks.map(([id]) => id));
+  const generalPicks = [...picks.entries()].filter(([id]) => !speechIds.has(id) && !realtimeIds.has(id));
   const togglePick = (id: string) => setPicks(previous => {
     const next = new Map(previous); const value = next.get(id);
     if (value) next.set(id, { ...value, checked: !value.checked });
@@ -1607,6 +1632,10 @@ export function AddProviderWizard({
         style={WINDOW_NO_DRAG_STYLE}
         className="modal-panel fixed inset-0 z-modal m-auto flex h-fit max-h-[min(640px,85vh)] w-[min(600px,calc(100vw-32px))] flex-col overflow-hidden outline-none"
       >
+        {activePluginStep ? (
+          <OfficialModelPluginStep item={activePluginStep.item} owner={activePluginStep.owner}
+            onBack={() => setPluginStep(undefined)} onDone={() => onDone()} />
+        ) : <>
         {/* 头部:标题居左 + 步骤指示居右,同一行(2026-07 定稿原型形态)。 */}
         <div className="flex items-center justify-between gap-4 px-4 pb-3 pt-4">
           <Dialog.Title asChild><h3
@@ -1832,6 +1861,33 @@ export function AddProviderWizard({
                       );
                     })}
                   </>
+                )}
+                {showOfficialModelPlugins && (matchingPlugins.length > 0 || officialPlugins.failed || officialPlugins.hasMore) && (
+                  <>
+                    <GroupLabel>{t('settings.providers.wizard.officialModelPlugins')}</GroupLabel>
+                    {matchingPlugins.map(item => (
+                      <ProviderRow
+                        key={item.pluginId}
+                        icon={cardIcon({ name: item.name })}
+                        name={item.name}
+                        meta={t('settings.providers.wizard.configurePlugin')}
+                        onClick={() => setPluginStep({ item, owner: getDataOwnerGeneration() })}
+                      />
+                    ))}
+                  </>
+                )}
+                {officialPlugins.hasMore && (
+                  <Button variant="secondary" data-settings-search-action="Load the next page of official model plugins" onClick={officialPlugins.loadMore}>
+                    {t('settings.ghosts.contribution.loadMore')}
+                  </Button>
+                )}
+                {officialPlugins.failed && (
+                  <div className="flex items-center justify-between gap-2 px-3 py-2">
+                    <span role="status">{t('settings.ghosts.market.unavailable')}</span>
+                    <Button variant="secondary" data-settings-search-action="Retry loading the official model plugin catalog" onClick={officialPlugins.retry}>
+                      {t('settings.providers.wizard.retryPlugin')}
+                    </Button>
+                  </div>
                 )}
                 {listedLocalPresets.length > 0 && (
                   <>
@@ -2117,6 +2173,7 @@ export function AddProviderWizard({
                       const agent = speechTarget?.agent ?? speechPicks[0]?.[1].agents[0];
                       if (!agent) return;
                       setPicks(previous => {
+                        if (previous.has(id) && !speechIds.has(id)) return previous;
                         const next = new Map(previous); const existing = next.get(id);
                         next.set(id, { ...existing, name: existing?.name ?? id, checked: true,
                           recommended: existing?.recommended ?? false, agents: existing?.agents ?? [agent],
@@ -2124,7 +2181,22 @@ export function AddProviderWizard({
                         return next;
                       });
                     }} />}
-                  {speechPicks.length > 0 && generalPicks.length > 0 && <p className="text-13 font-medium text-[var(--text-primary)]">{t('settings.providers.speechSetup.otherModels')}</p>}
+                  {(speechTarget?.service === 'openai' || speechTarget?.service === 'bailian' || realtimePicks.length > 0) && <SpeechModelChoices
+                    mode="realtime"
+                    choices={realtimePicks.map(([id, value]) => ({ id, ...value, manual: value.realtime }))}
+                    onToggle={togglePick}
+                    onAdd={id => {
+                      const agent = speechTarget?.agent ?? realtimePicks[0]?.[1].agents[0];
+                      if (!agent) return;
+                      setPicks(previous => {
+                        if (previous.has(id) && !realtimeIds.has(id)) return previous;
+                        const next = new Map(previous), old = next.get(id);
+                        next.set(id, { ...old, name: old?.name ?? id, checked: true, recommended: false,
+                          agents: old?.agents ?? [agent], realtime: true });
+                        return next;
+                      });
+                    }} />}
+                  {(speechPicks.length > 0 || realtimePicks.length > 0) && generalPicks.length > 0 && <p className="text-13 font-medium text-[var(--text-primary)]">{t('settings.providers.speechSetup.otherModels')}</p>}
                   {generalPicks.length > 0 && (
                     <div
                       className="flex flex-col overflow-hidden rounded-xl border"
@@ -2267,6 +2339,7 @@ export function AddProviderWizard({
         <div className="flex items-center justify-between px-4 pb-4 pt-2">
           <button
             type="button"
+            data-settings-search-action="Return to the previous wizard step or custom provider form"
             onClick={() => {
               if (savingRef.current) return;
               if (step === 2 && detected && onReturnCustom && sel?.kind === 'preset') {
@@ -2292,7 +2365,7 @@ export function AddProviderWizard({
                       const saved = original.models.find(row => row.id === id);
                       // Only checked rows return to the custom form. Do not
                       // resurrect an older disabled flag on this second save path.
-                      const { defaultEnabled: _oldEnabled, ...selectedModel }: Partial<ProviderRuntimeModelConfig> = saved ?? {};
+                      const { defaultEnabled: _oldEnabled, discoveredCost: _oldCost, ...selectedModel }: Partial<ProviderRuntimeModelConfig> = saved ?? {};
                       return { ...(!selectedModel.interfaceId && !selectedModel.api && !selectedModel.piApi && !selectedModel.route
                         && model.interfaceIds?.[target] ? { interfaceId: model.interfaceIds[target] } : {}),
                         ...selectedModel, id, name: model.name,
@@ -2300,6 +2373,7 @@ export function AddProviderWizard({
                         discoveredSource: model.discoveredSources?.[target],
                         discoverySnapshotId: model.discoverySnapshotIds?.[target],
                         opaqueModelId: model.opaqueModelIds?.[target] || saved?.opaqueModelId,
+                        ...(model.discoveredCosts?.[target] ? { discoveredCost: model.discoveredCosts[target] } : {}),
                         ...(saved?.route ?? model.routes?.[target] ? { route: saved?.route ?? model.routes?.[target] } : {}),
                       };
                     }) : original.models;
@@ -2382,6 +2456,7 @@ export function AddProviderWizard({
             )}
           </div>
         </div>
+        </>}
       </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
