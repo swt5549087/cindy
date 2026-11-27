@@ -260,7 +260,7 @@ describe('MakerScheduleRunner ephemeral 会话收尾(run 终态后 closeSession)
     expect(closeSession).toHaveBeenCalledWith('scheduler-session');
   });
 
-  it('heartbeat(绑定既有会话)不关闭 —— 会话生命周期不归 runner 管', async () => {
+  it('resumes a cold Codex heartbeat with the stored thread and keeps the resumed runtime', async () => {
     const h = createSessionHarness();
     const { runner, maker, closeSession } = createRunnerHarness(h.session);
     (maker.getSessionMeta as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -277,7 +277,10 @@ describe('MakerScheduleRunner ephemeral 会话收尾(run 终态后 closeSession)
 
     expect(closeSession).not.toHaveBeenCalled();
     expect(maker.createSession).toHaveBeenCalledWith(
-      expect.objectContaining({ vendorOptions: { source: 'scheduler' } }),
+      expect.objectContaining({
+        id: 'scheduler-session', agentKind: 'codex', resumeSessionId: 'sdk-1',
+        vendorOptions: { source: 'scheduler' },
+      }),
     );
     expect(h.headlessDuringSend).toEqual([false]);
     expect(h.headlessAfterAccepted).toEqual([true]);

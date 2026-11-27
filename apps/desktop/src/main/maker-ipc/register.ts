@@ -13264,6 +13264,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
       lockStage = 'lazy-resume-bootstrap';
       try {
+        // An ordinary local Codex task can be cold solely because its process was
+        // reclaimed. Dispatch must keep the same stored permissions as a live send.
+        const resumeWithStoredPermissionMode = params.resumeWithStoredPermissionMode
+          || (targetAgentKind === 'codex' && !dbRow.remoteHostId && !dbRow.agentDeviceId
+            && !dbRow.orcaRole && !dbRow.orcaRemoteLead
+            && (dbRow.source === 'desktop' || dbRow.source === 'scheduler'));
         const createOpts = buildCreateOptsWithStderr({
           id: targetSessionId,
           agentKind: targetAgentKind,
@@ -13274,12 +13280,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           // 的缺省 bypass 提权;档位不一致还会让 errand 复用判定每轮都失败、另开新会话
           // (#5788)。由宿主的插件派发、伙伴后台任务派发等入口显式要求,未要求的 main 侧
           // 通路(Orca 派活等)保持既有缺省。
-          permissionMode: params.resumeWithStoredPermissionMode
+          permissionMode: resumeWithStoredPermissionMode
             ? permissionModeOrAsk(dbRow.permissionMode)
             : 'bypassPermissions',
           // 计划模式同理按落库状态起档,运行态才与库内一致(心跳等权限边界读取方要求两者
           // 相同)。下方 send 带 planMode:false,本轮仍是普通执行、不消耗武装态。
-          ...(params.resumeWithStoredPermissionMode
+          ...(resumeWithStoredPermissionMode
             ? { planMode: dbRow.planModeEnabled === true }
             : {}),
           // 发起方回合结束后进程常被释放。漏掉 providerId = 回落到隐式默认路由,
@@ -17417,7 +17423,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       || isSessionTurnPendingCompletion(id) || Boolean(getClaudeSessionBackgroundActivity(id)),
   });
 
-  // Ordinary local Codex tasks: same scope and gates as Claude. Codex does not
+  // Ordinary and scheduled local Codex tasks share Claude's input gates. Codex does not
   // list its native children, yielded exec cells or background terminals as
   // background tasks, so the watcher also awaits Session.hasLiveBackgroundWork
   // (unknown = busy). Closing unsubscribes the thread and retires a
@@ -17430,7 +17436,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     readMinutes: () => DEFAULT_CODEX_IDLE_RELEASE_MINUTES,
     isOrdinaryTask: createOrdinaryIdleReleaseTaskCheck(getDbClient, ORDINARY_CODEX_TASK_SQL),
     hasPendingInput: hasPendingIdleReleaseInput,
-    isHostBusy: isIdleReleaseHostBusy,
+    // A scheduled turn can remain in finalization after its SDK turn settles.
+    isHostBusy: (id) => isIdleReleaseHostBusy(id) || isHeadlessGhostSetupTurn(id),
     withLock: withSendToSessionLock,
     close: createIdleReleaseRuntimeClose(maker, withRehydrateCloseSuppressed),
     now: () => performance.now(),

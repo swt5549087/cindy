@@ -106,16 +106,19 @@ async function fixture(t) {
     setClaudeMinutes(minutes) { claudeMinutes = minutes; } };
 }
 
-test('idle release: ordinary Claude, Codex and Pi tasks release their runtimes after 30 idle minutes, idle-only and resumable', async t => {
+test('idle release: Codex releases after 15 minutes and Claude and Pi after 30, with resumable state', async t => {
   const f = await fixture(t);
   await f.task('claude', 'claude-code');
   await f.task('codex', 'codex');
   await f.task('pi', 'pi');
   await f.release.scanNow();
-  f.pass(29 * MINUTE);
+  f.pass(15 * MINUTE - 1);
   await f.release.scanNow();
-  assert.deepEqual(f.released(), [], 'not before 30 minutes');
-  f.pass(2 * MINUTE);
+  assert.deepEqual(f.released(), [], 'not before 15 minutes');
+  f.pass(1);
+  await f.release.scanNow();
+  assert.deepEqual(f.released(), ['codex']);
+  f.pass(16 * MINUTE);
   await f.release.scanNow();
   assert.deepEqual(f.released(), ['claude', 'codex', 'pi']);
   for (const close of f.closes) {

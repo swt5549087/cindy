@@ -56,7 +56,7 @@ function lazyResumeCreateOpts(): string {
 describe('sendToSessionInternal lazy-resume permission mode', () => {
   it('restores the stored permission mode when the host asks for it', () => {
     expect(lazyResumeCreateOpts()).toContain(
-      `permissionMode: params.resumeWithStoredPermissionMode
+      `permissionMode: resumeWithStoredPermissionMode
             ? permissionModeOrAsk(dbRow.permissionMode)
             : 'bypassPermissions',`,
     );
@@ -161,7 +161,7 @@ const loadBotTaskDispatch = new Function(
 };
 
 function botTaskDispatchHarness(
-  rows: Record<string, { permissionMode: string | null; planModeEnabled: boolean }>,
+  rows: Record<string, { permissionMode: string | null; planModeEnabled: boolean; source?: string }>,
   live: Record<string, object> = {},
   overrides: Record<string, unknown> = {},
 ) {
@@ -829,6 +829,24 @@ describe('group dispatch cancellation during preparation', () => {
 });
 
 describe('stored-mode Host dispatch keeps the persisted permission and Plan', () => {
+  // Guard: the desktop lazy-send closure must not elevate an ordinary Codex
+  // task on its first send after idle release. Plugin and delegation cases
+  // below opt in explicitly and would miss the unflagged cold send.
+  it.each(['desktop', 'scheduler'])('resumes a cold %s Codex task with its saved mode and thread', async source => {
+    const h = botTaskDispatchHarness({ child: { source, permissionMode: 'ask', planModeEnabled: true } }, {}, {
+      maker: {
+        getSession: () => undefined,
+        getSessionMeta: async () => ({ id: 'child', agentKind: 'codex', workDir: '/tmp/fixture/child',
+          model: 'gpt-5.4', sdkSessionId: 'saved-thread' }),
+      },
+    });
+    const result = await h.sendToSessionInternal({ targetSessionId: 'child', message: 'Continue' });
+    expect(result).toMatchObject({ ok: true, wakeKind: 'resumed' });
+    expect(h.bootstrapped).toEqual([expect.objectContaining({
+      resumeSessionId: 'saved-thread', permissionMode: 'ask', planMode: true,
+    })]);
+  });
+
   // PR #10271 / Greptile, guard: sendToSessionInternal kept the old provider snapshot after
   // account recovery changed the persisted source. Execute the real dispatch closure: a legacy
   // source becomes OpenAI, lazy bootstrap must use it without changing this entry's permission policy.

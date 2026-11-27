@@ -6,8 +6,8 @@ export type IdleClaudeSession = Pick<Session, 'id' | 'agentKind' | 'remoteHostId
   | 'getStatus' | 'getTurnGeneration' | 'isTurnRunning' | 'listBackgroundTasks'
   | 'countPendingWakeContinuations' | 'manageAsyncUserQuestions' | 'onEvent' | 'closeIfIdle' | 'close'>
   & Partial<Pick<Session, 'hasLiveBackgroundWork'>>;
-/** Codex mirrors the Pi and Claude 30-minute default; no separate setting. */
-export const DEFAULT_CODEX_IDLE_RELEASE_MINUTES = 30;
+/** Default for ordinary local Codex tasks, including scheduled tasks. */
+export const DEFAULT_CODEX_IDLE_RELEASE_MINUTES = 15;
 export const DEFAULT_ANTIGRAVITY_IDLE_RELEASE_MINUTES = 15;
 /** Engines whose ordinary local tasks share this reclamation policy. */
 export type IdleReleaseAgentKind = 'claude-code' | 'codex' | 'antigravity';
@@ -40,11 +40,15 @@ interface IdleReleaseState {
 }
 
 /** Scope query runs through the DB worker; source and ownership are host facts. */
+const idleReleaseTaskSources = {
+  cc: "'desktop'",
+  codex: "'desktop', 'scheduler'",
+  antigravity: "'desktop', 'bot'",
+};
 const ordinaryTaskSql = (dbAgentKind: 'cc' | 'codex' | 'antigravity') => `SELECT id FROM sessions s
 WHERE s.id = ? AND s.status = 'active'
-AND ${dbAgentKind === 'antigravity'
-  ? "s.source IN ('desktop', 'bot')"
-  : "s.source = 'desktop' AND NOT EXISTS (SELECT 1 FROM bot_session_links b WHERE b.session_id = s.id)"}
+AND s.source IN (${idleReleaseTaskSources[dbAgentKind]})
+${dbAgentKind === 'antigravity' ? '' : 'AND NOT EXISTS (SELECT 1 FROM bot_session_links b WHERE b.session_id = s.id)'}
 AND s.hidden_at IS NULL AND s.agent_device_id IS NULL
 AND s.sdk_session_id = ? AND s.sdk_session_id != '<pending>'
 AND s.agent_kind = '${dbAgentKind}' AND s.remote_host_id IS NULL AND s.orca_role IS NULL
@@ -52,7 +56,7 @@ AND NOT EXISTS (SELECT 1 FROM orca_workers w WHERE w.session_id = s.id)
 AND NOT EXISTS (SELECT 1 FROM orca_teams t WHERE t.lead_session_id = s.id AND t.status = 'active')
 AND NOT EXISTS (SELECT 1 FROM session_goals g WHERE g.session_id = s.id AND g.status != 'complete')`;
 export const ORDINARY_CLAUDE_TASK_SQL = ordinaryTaskSql('cc');
-/** Same ordinary-task scope for Codex: bots, Orca, Goals, remote and hidden tasks keep their own lifecycle. */
+/** Includes scheduled Codex tasks. Bots, Orca, Goals, remote and hidden tasks keep their own lifecycle. */
 export const ORDINARY_CODEX_TASK_SQL = ordinaryTaskSql('codex');
 export const ORDINARY_ANTIGRAVITY_TASK_SQL = ordinaryTaskSql('antigravity');
 

@@ -596,16 +596,18 @@ try {
     'Codex upstream request carries the Cindy product prompt');
 
   // ---- Idle runtime release, through the queue as main.ts wires it (idle-release.ts) ----
-  // An ordinary task idle for 30 minutes (a test clock, no real wait) releases its native Codex
+  // A scheduled task idle for 15 minutes (a test clock) releases its native Codex
   // runtime; the next message resumes the same native thread, whose history reaches the upstream.
   {
     const idleTask = 'idle-release-native-fixture';
     await new OwnerSessionStorage({ db: () => database }).create({ id: idleTask,
       title: 'Idle release fixture', agentKind: 'codex', model: 'fixture-model', workDir: root });
-    await database.drizzle.update(sessions).set({ providerId: 'cprov-fixture' }).where(eq(sessions.id, idleTask));
+    await database.drizzle.update(sessions).set({ providerId: 'cprov-fixture', source: 'scheduler' }).where(eq(sessions.id, idleTask));
     const clock = { monotonic: 0, wall: Date.now() };
     const idleQueue = createInputQueue({ getMaker: () => graph.maker, hub, readSession,
       getOwner: getCurrentDbClientSnapshot,
+      // The only route in this fixture is the local synthetic provider above.
+      admitLocalRoute: async () => {},
       persistMessage: createHostMessageStore({ getOwner: getCurrentDbClientSnapshot, publish: event => hub.publish(event) }),
       markStarted: async id => { markSessionTurnStarted(id); await drainSessionActiveTurnWrites(id); },
       markEnded: async (id, at) => { markSessionTurnEnded(id, at); await drainSessionActiveTurnWrites(id); },
@@ -627,16 +629,26 @@ try {
       let done = turnDone();
       await idleQueue.enqueue(idleTask, { clientId: 'idle-first', text: 'remember the word heron' });
       await done;
+      // The done event is published before the executor settles its durable turn state.
+      const settleDeadline = Date.now() + 5_000;
+      while (idleQueue.hasRunningTurns() && Date.now() < settleDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal(idleQueue.hasRunningTurns(), false, 'the first turn settled before starting the idle clock');
       const live = graph.maker.getSession(idleTask);
       assert.ok(live?.sdkSessionId, 'the first turn has a native thread');
       const thread = live.sdkSessionId;
       await idleQueue.scanIdleRelease();
-      assert.equal(graph.maker.getSession(idleTask), live, 'not released before 30 idle minutes');
-      clock.monotonic += 31 * 60_000;
-      clock.wall = Date.now() + 31 * 60_000;
+      clock.monotonic += 899_999;
+      clock.wall += 899_999;
       await idleQueue.scanIdleRelease();
-      assert.equal(graph.maker.getSession(idleTask), undefined, 'released after 30 idle minutes');
+      assert.equal(graph.maker.getSession(idleTask), live, 'not released before 15 idle minutes');
+      clock.monotonic += 1;
+      clock.wall += 1;
+      await idleQueue.scanIdleRelease();
+      assert.equal(graph.maker.getSession(idleTask), undefined, 'released after 15 idle minutes');
       const [row] = await database.drizzle.select().from(sessions).where(eq(sessions.id, idleTask)).limit(1);
+      assert.equal(row.status, 'active', 'the task stays active after runtime release');
       assert.equal(row.sdkSessionId, thread, 'the task keeps its native thread');
       const before = requests.length;
       done = turnDone();
@@ -646,7 +658,7 @@ try {
       const resumed = JSON.stringify(requests.slice(before).map(request => request.body.input));
       assert.match(resumed, /remember the word heron/, 'the resumed request carries the first turn');
     } finally { await idleQueue.dispose(); }
-    console.log('PASS native Codex idle release through the production wiring: released after 30 idle minutes (test clock); the next message resumes the same native thread with its history');
+    console.log('PASS native Codex idle release through the production wiring: released after 15 idle minutes (test clock); the next message resumes the same native thread with its history');
   }
   console.log('PASS the Codex upstream request carries the Cindy product system prompt');
   console.log('PASS native Codex + production Host: gateway and custom provider turns; key rotation during a live turn preserves completion and the next gateway task uses the new key');

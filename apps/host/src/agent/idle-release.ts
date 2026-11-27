@@ -29,9 +29,9 @@ const log = createLogger('host-idle-release');
 
 /**
  * The desktop's idle-runtime release (register.ts: the Claude, Codex and Pi watchers) for one
- * owner's input runtime: ordinary local tasks idle for 30 minutes (Claude: the
- * claude-idle-release.json override in the profile root) release their runtime, and the next send
- * resumes the native session. Same watchers, same gates and the same send lock as the desktop.
+ * owner's input runtime. Codex releases at 15 idle minutes, Pi and Claude at 30
+ * (Claude supports the claude-idle-release.json override). The next send resumes
+ * the native session. Both hosts share the watchers, input gates and send lock.
  *
  * The desktop's facts arrive as ports: whether the turn is still settling (the desktop's
  * isSessionTurnPendingCompletion; the Host executor's running turn), whether an Agent interaction

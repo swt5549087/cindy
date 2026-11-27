@@ -7,7 +7,8 @@ import { createRehydrateCloseSuppression } from '../../maker-host/rehydrateClose
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createClaudeIdleReleaseWatcher, createIdleReleaseRuntimeClose, createOrdinaryIdleReleaseTaskCheck,
-  DEFAULT_ANTIGRAVITY_IDLE_RELEASE_MINUTES, ORDINARY_ANTIGRAVITY_TASK_SQL, ORDINARY_CLAUDE_TASK_SQL,
+  DEFAULT_ANTIGRAVITY_IDLE_RELEASE_MINUTES, DEFAULT_CODEX_IDLE_RELEASE_MINUTES,
+  ORDINARY_ANTIGRAVITY_TASK_SQL, ORDINARY_CLAUDE_TASK_SQL,
   ORDINARY_CODEX_TASK_SQL, type IdleClaudeSession, type IdleReleaseAgentKind,
 } from '../claudeIdleReleaseWatcher';
 import { AgentInputCoordinator } from '../agent-input-coordinator';
@@ -33,7 +34,8 @@ function fixture(agentKind: IdleReleaseAgentKind = 'claude-code') {
   const deps = {
     agentKind,
     listSessions: () => live, getSession: (id: string) => live.find(s => s.id === id),
-    readMinutes: vi.fn((): number => agentKind === 'antigravity' ? DEFAULT_ANTIGRAVITY_IDLE_RELEASE_MINUTES : 30),
+    readMinutes: vi.fn((): number => agentKind === 'codex' ? DEFAULT_CODEX_IDLE_RELEASE_MINUTES
+      : agentKind === 'antigravity' ? DEFAULT_ANTIGRAVITY_IDLE_RELEASE_MINUTES : 30),
     isOrdinaryTask: vi.fn(async (_id: string, _nativeId: string) => true),
     hasPendingInput: vi.fn(async () => false), isHostBusy: vi.fn(() => false),
     withLock: async (_id: string, fn: () => Promise<void>) => fn(),
@@ -47,10 +49,11 @@ function fixture(agentKind: IdleReleaseAgentKind = 'claude-code') {
   const watcher = createClaudeIdleReleaseWatcher(deps);
   return { session, deps, watcher, unsubscribe, event: () => event(),
     advance: (minutes: number) => { now += minutes * 60_000; },
+    advanceMs: (ms: number) => { now += ms; },
     nextTurn: () => { generation++; }, replace: (s: IdleClaudeSession) => { live = [s]; } };
 }
 async function aged(f: ReturnType<typeof fixture>) {
-  await f.watcher.scanNow(); f.advance(30);
+  await f.watcher.scanNow(); f.advance(f.deps.readMinutes());
 }
 afterEach(() => vi.useRealTimers());
 
@@ -66,8 +69,8 @@ describe('ordinary Claude idle runtime release', () => {
     f.watcher.stop();
   });
   it.each(['turn', 'background', 'background-unavailable', 'live-background', 'live-background-unknown', 'wake', 'host', 'queue', 'scope', 'unknown', 'question', 'answer-in-flight', 'questions-unavailable'] as const)(
-    'preserves a runtime blocked by %s', async (kind) => {
-      const f = fixture(); await aged(f);
+    'preserves a Codex runtime blocked by %s at the 15-minute boundary', async (kind) => {
+      const f = fixture('codex'); await aged(f);
       if (kind === 'turn') vi.mocked(f.session.isTurnRunning).mockReturnValue(true);
       if (kind === 'background') vi.mocked(f.session.listBackgroundTasks).mockReturnValue([{ taskId: 'still-working' }]);
       if (kind === 'background-unavailable') vi.mocked(f.session.listBackgroundTasks).mockImplementation(() => { throw Error('unavailable'); });
@@ -105,11 +108,11 @@ describe('ordinary Claude idle runtime release', () => {
     await aged(f); await f.watcher.scanNow();
     expect(f.deps.close).not.toHaveBeenCalled(); f.watcher.stop();
   });
-  it('resets for events and for short turns completed between scans', async () => {
-    const f = fixture(); await aged(f); f.event();
+  it('restarts the Codex idle window after events and short turns between scans', async () => {
+    const f = fixture('codex'); await aged(f); f.event();
     await f.watcher.scanNow(); expect(f.deps.close).not.toHaveBeenCalled();
-    f.advance(30); f.nextTurn(); await f.watcher.scanNow();
-    expect(f.deps.close).not.toHaveBeenCalled(); f.advance(30);
+    f.advance(15); f.nextTurn(); await f.watcher.scanNow();
+    expect(f.deps.close).not.toHaveBeenCalled(); f.advance(15);
     await f.watcher.scanNow(); expect(f.deps.close).toHaveBeenCalledOnce();
   });
   it.each(['stop', 'replace', 'turn', 'event', 'disable', 'queue', 'identity', 'question', 'wake'] as const)(
@@ -151,12 +154,16 @@ describe('ordinary Claude idle runtime release', () => {
     await f.watcher.scanNow(); f.deps.readMinutes.mockReturnValue(0); await f.watcher.scanNow();
     expect(f.unsubscribe).toHaveBeenCalledOnce(); f.watcher.stop();
   });
-  it('releases idle Codex tasks only once their live background work ends, leaving other engines alone', async () => {
-    const f = fixture('codex'); await aged(f);
+  // Unit: production watcher and default. The 30-minute fixture never tested
+  // the requested 900,000 ms boundary or restarting that window after native work.
+  it('releases Codex after 15 idle minutes once native work ends', async () => {
+    const f = fixture('codex');
+    await f.watcher.scanNow(); f.advance(15);
     vi.mocked(f.session.hasLiveBackgroundWork!).mockResolvedValueOnce(true);
     await f.watcher.scanNow(); expect(f.deps.close).not.toHaveBeenCalled();
-    f.advance(29); await f.watcher.scanNow(); expect(f.deps.close).not.toHaveBeenCalled();
-    f.advance(1); await f.watcher.scanNow(); expect(f.deps.close).toHaveBeenCalledOnce();
+    expect(f.session.hasLiveBackgroundWork).toHaveBeenCalledOnce();
+    f.advanceMs(899_999); await f.watcher.scanNow(); expect(f.deps.close).not.toHaveBeenCalled();
+    f.advanceMs(1); await f.watcher.scanNow(); expect(f.deps.close).toHaveBeenCalledOnce();
     f.replace({ ...f.session, agentKind: 'claude-code' }); await f.watcher.scanNow();
     expect(f.session.onEvent).toHaveBeenCalledOnce(); f.watcher.stop();
   });
@@ -280,6 +287,8 @@ describe('ordinary task eligibility in SQLite', () => {
       expect(db.prepare(ORDINARY_CLAUDE_TASK_SQL).get('task', 'native-history')).toBeUndefined();
       expect(db.prepare('SELECT status, sdk_session_id FROM sessions WHERE id = ?').get('task'))
         .toEqual({ status: 'active', sdk_session_id: 'native-history' });
+      db.exec("UPDATE sessions SET source = 'scheduler'");
+      if (kind === 'codex') expect(eligible.get('task', 'native-history')).toEqual({ id: 'task' });
       db.exec("INSERT INTO bot_session_links VALUES ('task')");
       if (kind === 'codex') expect(eligible.get('task', 'native-history')).toBeUndefined();
       db.exec("UPDATE sessions SET source = 'bot'");
@@ -412,7 +421,9 @@ it.each([
   }
 });
 
-it('keeps a real Codex Session while native work lives, then releases and resumes its thread', async () => {
+// Unit: Maker close/resume with a scheduler-owned source row. The earlier fixture
+// bypassed the SQL gate that kept every persistent schedule runtime alive.
+it('keeps a scheduled Codex Session while native work lives, then releases and resumes its thread', async () => {
   const rows = new Map<string, SessionMeta>();
   const storage: SessionStorage = {
     create: async meta => { const row = { ...meta, createdAt: 1, updatedAt: 1 }; rows.set(meta.id, row); return row; },
@@ -426,6 +437,7 @@ it('keeps a real Codex Session while native work lives, then releases and resume
   const suppression = createRehydrateCloseSuppression(log);
   const removeAttachmentsAndWorkspace = vi.fn(async () => {});
   let liveWork: () => Promise<boolean> = async () => true;
+  const probe = vi.fn(() => liveWork());
   const handles: AgentSessionHandle[] = [];
   const startSession = vi.fn(async (opts: StartSessionOptions) => {
     let finish!: () => void;
@@ -437,7 +449,7 @@ it('keeps a real Codex Session while native work lives, then releases and resume
       close: vi.fn(async () => { finish(); }),
       async *events() { await ended; },
       isTurnRunning: () => false, setInteractionResolver() {},
-      hasLiveBackgroundWork: () => liveWork(),
+      hasLiveBackgroundWork: probe,
     };
     handles.push(handle);
     return handle;
@@ -448,28 +460,32 @@ it('keeps a real Codex Session while native work lives, then releases and resume
     lifecycleHooks: { onClose: id => suppression.runOnCloseSideEffects(id, removeAttachmentsAndWorkspace) } });
   const opts = { id: 'task', agentKind: 'codex' as const, workingDir: path.join(os.tmpdir(), 'codex-idle-fixture'), model: 'model' };
   const first = await maker.createSession(opts);
+  const db = eligibilityDatabase();
+  db.prepare("UPDATE sessions SET source = 'scheduler', agent_kind = 'codex', sdk_session_id = ? WHERE id = ?")
+    .run(first.sdkSessionId, first.id);
+  const eligible = db.prepare(ORDINARY_CODEX_TASK_SQL);
   const stored = { ...rows.get('task')! };
   let now = 0;
   const watcher = createClaudeIdleReleaseWatcher({
     agentKind: 'codex',
     listSessions: () => maker.listActiveSessions(), getSession: id => maker.getSession(id),
-    readMinutes: () => 30,
-    isOrdinaryTask: async (id, nativeId) => (await storage.get(id))?.sdkSessionId === nativeId,
+    readMinutes: () => DEFAULT_CODEX_IDLE_RELEASE_MINUTES,
+    isOrdinaryTask: async (id, nativeId) => Boolean(eligible.get(id, nativeId)),
     hasPendingInput: async () => false, isHostBusy: () => false,
     withLock: async (_id, fn) => fn(),
-    close: (session) => suppression.withSuppressed(session.id, async () =>
-      await maker.closeSessionIfCurrent(session as typeof first, 'runtime-refresh', { onlyIfIdle: true }) === 'closed'),
+    close: createIdleReleaseRuntimeClose(maker, suppression.withSuppressed),
     now: () => now, released: vi.fn(), warn: log.warn,
   });
   try {
-    await watcher.scanNow(); now = 30 * 60_000; await watcher.scanNow();
+    await watcher.scanNow(); now = 900_000; await watcher.scanNow();
     expect(handles[0].close).not.toHaveBeenCalled();
+    expect(probe).toHaveBeenCalledOnce();
     // A probe that cannot answer is treated as busy by Session itself.
     liveWork = async () => { throw Error('terminal list unavailable'); };
-    now += 30 * 60_000; await watcher.scanNow();
+    now += 900_000; await watcher.scanNow();
     expect(handles[0].close).not.toHaveBeenCalled();
     liveWork = async () => false;
-    now += 30 * 60_000; await watcher.scanNow();
+    now += 900_000; await watcher.scanNow();
     expect(handles[0].close).toHaveBeenCalledOnce();
     expect(maker.getSessionCloseReason(first)).toBe('runtime-refresh');
     expect(rows.get('task')).toEqual(stored);
@@ -482,6 +498,7 @@ it('keeps a real Codex Session while native work lives, then releases and resume
     expect(handles[1].send).toHaveBeenCalledOnce();
   } finally {
     watcher.stop();
+    db.close();
     await maker.shutdown();
     suppression.resetForTest();
   }
