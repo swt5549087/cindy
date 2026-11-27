@@ -5,19 +5,22 @@ import type { DbClient } from '../localDb/client/DbClient.js';
 export type IdleClaudeSession = Pick<Session, 'id' | 'agentKind' | 'remoteHostId' | 'agentDeviceId' | 'sdkSessionId'
   | 'getStatus' | 'getTurnGeneration' | 'isTurnRunning' | 'listBackgroundTasks'
   | 'countPendingWakeContinuations' | 'manageAsyncUserQuestions' | 'onEvent' | 'closeIfIdle' | 'close'>
-  & Partial<Pick<Session, 'hasLiveBackgroundWork'>>;
+  & Partial<Pick<Session, 'hasLiveBackgroundWork' | 'canResumeAfterClose'>>;
 /** Default for ordinary local Codex tasks, including scheduled tasks. */
 export const DEFAULT_CODEX_IDLE_RELEASE_MINUTES = 15;
 export const DEFAULT_ANTIGRAVITY_IDLE_RELEASE_MINUTES = 15;
+/** Plugin engines (ACP) follow the same 30-minute default; no separate setting. */
+export const DEFAULT_PLUGIN_ENGINE_IDLE_RELEASE_MINUTES = 30;
 /** Engines whose ordinary local tasks share this reclamation policy. */
-export type IdleReleaseAgentKind = 'claude-code' | 'codex' | 'antigravity';
+export type IdleReleaseAgentKind = 'claude-code' | 'codex' | 'antigravity' | 'acp';
 const engineLabels: Record<IdleReleaseAgentKind, string> = {
   'claude-code': 'Claude',
   codex: 'Codex',
   antigravity: 'Antigravity',
+  acp: 'Plugin engine',
 };
 export interface ClaudeIdleReleaseDeps {
-  /** Defaults to Claude. */
+  /** Defaults to Claude. Runtimes that cannot reopen their conversation are kept. */
   agentKind?: IdleReleaseAgentKind;
   listSessions(): IdleClaudeSession[];
   getSession(id: string): IdleClaudeSession | undefined;
@@ -42,10 +45,11 @@ interface IdleReleaseState {
 /** Scope query runs through the DB worker; source and ownership are host facts. */
 const idleReleaseTaskSources = {
   cc: "'desktop'",
+  acp: "'desktop'",
   codex: "'desktop', 'scheduler'",
   antigravity: "'desktop', 'bot'",
 };
-const ordinaryTaskSql = (dbAgentKind: 'cc' | 'codex' | 'antigravity') => `SELECT id FROM sessions s
+const ordinaryTaskSql = (dbAgentKind: keyof typeof idleReleaseTaskSources) => `SELECT id FROM sessions s
 WHERE s.id = ? AND s.status = 'active'
 AND s.source IN (${idleReleaseTaskSources[dbAgentKind]})
 ${dbAgentKind === 'antigravity' ? '' : 'AND NOT EXISTS (SELECT 1 FROM bot_session_links b WHERE b.session_id = s.id)'}
@@ -59,6 +63,8 @@ export const ORDINARY_CLAUDE_TASK_SQL = ordinaryTaskSql('cc');
 /** Includes scheduled Codex tasks. Bots, Orca, Goals, remote and hidden tasks keep their own lifecycle. */
 export const ORDINARY_CODEX_TASK_SQL = ordinaryTaskSql('codex');
 export const ORDINARY_ANTIGRAVITY_TASK_SQL = ordinaryTaskSql('antigravity');
+/** Same scope for plugin engine tasks; their Orca workers keep their lifecycle like any engine's. */
+export const ORDINARY_PLUGIN_ENGINE_TASK_SQL = ordinaryTaskSql('acp');
 
 /** Whether a task is in the ordinary scope, by the given SQL against the database the caller reads now. */
 export function createOrdinaryIdleReleaseTaskCheck(
@@ -96,7 +102,8 @@ export function createClaudeIdleReleaseWatcher(deps: ClaudeIdleReleaseDeps) {
   const busy = (session: IdleClaudeSession, retryFailedClose = false) =>
     (session.getStatus() !== 'active' && !(retryFailedClose && session.getStatus() === 'error'))
     || !session.sdkSessionId || session.sdkSessionId === '<pending>' || session.isTurnRunning() || session.listBackgroundTasks().length > 0
-    || session.countPendingWakeContinuations() > 0 || deps.isHostBusy(session.id);
+    || session.countPendingWakeContinuations() > 0 || session.canResumeAfterClose?.() === false
+    || deps.isHostBusy(session.id);
   // Session.close expires these cards. Unlike synchronous questions, async
   // questions deliberately do not hold a product turn or a host interaction lock.
   const hasQuestions = (session: IdleClaudeSession) => session.getStatus() === 'active'

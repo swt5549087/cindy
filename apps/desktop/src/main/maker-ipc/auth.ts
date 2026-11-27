@@ -1,3 +1,4 @@
+import { cloudManagementProviderRegistry } from '../host-settings/managementCalls.js';
 /**
  * apps/desktop/src/main/maker-ipc/auth.ts
  *
@@ -41,7 +42,7 @@ export function registerMakerAuthIpc(maker: Maker): void {
   log.info('registering maker:auth:* IPC handlers');
 
   registerMakerAuthHandlers(
-    createElectronIpcHandlerRegistry(),
+    cloudManagementProviderRegistry(createElectronIpcHandlerRegistry()),
     maker,
     broadcast,
     readClaudeApiKey,

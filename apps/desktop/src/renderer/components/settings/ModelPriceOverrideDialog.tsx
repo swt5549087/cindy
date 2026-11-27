@@ -18,6 +18,7 @@ import type {
 import type { UnionModelRow } from './UnifiedModelList';
 import { providersSettings } from './ProvidersSection.settings-search';
 import { useSettingDefinition } from './useSettingDefinition';
+import { useModelSettingsSource } from './modelSettingsSource';
 
 const AGENT_LABEL: Record<AgentKind, string> = {
   'claude-code': 'Claude Code',
@@ -109,6 +110,12 @@ export function ModelPriceOverrideDialog({ provider, row, open, onOpenChange, pr
     setSaving(pending);
     onPendingChange?.(pending);
   };
+  // Another device's settings (cloud instance page) answer instead of this device.
+  const source = useModelSettingsSource();
+  const sourceRef = useRef(source);
+  sourceRef.current = source;
+  // Resolved when a request runs, like a direct preload call.
+  const maker = () => sourceRef.current?.maker ?? window.electronAPI.maker;
 
   const model = row.byAgent[agent];
   const target = useMemo(
@@ -152,7 +159,7 @@ export function ModelPriceOverrideDialog({ provider, row, open, onOpenChange, pr
     setLoading(true);
     setView(null);
     setForm(EMPTY_FORM);
-    void window.electronAPI.maker
+    void maker()
       .getModelPriceOverride(target)
       .then((next) => {
         if (cancelled) return;
@@ -205,7 +212,7 @@ export function ModelPriceOverrideDialog({ provider, row, open, onOpenChange, pr
     setPending(true);
     const epoch = mutationEpochRef.current;
     try {
-      const next = await window.electronAPI.maker.setModelPriceOverride(target, desired);
+      const next = await maker().setModelPriceOverride(target, desired);
       if (mutationEpochRef.current !== epoch) return false;
       setView(next);
       setForm(formFromView(next));
@@ -231,7 +238,7 @@ export function ModelPriceOverrideDialog({ provider, row, open, onOpenChange, pr
     setPending(true);
     const epoch = mutationEpochRef.current;
     try {
-      const next = await window.electronAPI.maker.resetModelPriceOverride(target);
+      const next = await maker().resetModelPriceOverride(target);
       if (mutationEpochRef.current !== epoch) return;
       setView(next);
       setForm(formFromView(next));

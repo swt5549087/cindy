@@ -393,7 +393,7 @@ describe('sendToSession ordering', () => {
     const liveBranch = extractBetween(
       block,
       'live = maker.getSession(targetSessionId);',
-      'try {\n        const createOpts = buildCreateOptsWithStderr({',
+      'const createOpts = buildCreateOptsWithStderr({\n          id: targetSessionId,',
     );
     const resumedBranch = extractBetween(
       block,
@@ -760,7 +760,7 @@ describe('sendToSession ordering', () => {
     const liveBranch = extractBetween(
       block,
       'live = maker.getSession(targetSessionId);',
-      'try {\n        const createOpts = buildCreateOptsWithStderr({',
+      'const createOpts = buildCreateOptsWithStderr({\n          id: targetSessionId,',
     );
 
     expect(liveBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(');

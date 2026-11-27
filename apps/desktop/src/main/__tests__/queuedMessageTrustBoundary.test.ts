@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
+import { stripTaskDispatchOrigin } from '../maker-ipc/taskDispatchReceipt';
 
 // Execute the production validator without booting register.ts's Electron host.
 const source = readFileSync(new URL('../maker-ipc/register.ts', import.meta.url), 'utf8');
@@ -25,6 +26,7 @@ describe('queued IPC host policy boundary', () => {
       isDeviceLinkInvoke: () => remote,
       requireSessionRefs: () => undefined,
       requireTrustedReferenceContexts: () => undefined,
+      stripTaskDispatchOrigin,
       throwIpcError: (_code: string, message: string) => { throw new Error(message); },
     });
     for (const toolsDisabled of [true, false, 'true']) {

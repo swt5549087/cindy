@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import os from 'node:os';
 import path from 'node:path';
-import { makerToDbAgentKind } from '../../../shared/agentKindConversion';
+import { makerToDbEngineKind } from '../../../shared/agentKindConversion';
 import { Maker, type AgentSessionHandle, type BaseAgent, type SessionMeta, type SessionStorage, type StartSessionOptions } from '@cindy/maker-core';
 import { createRehydrateCloseSuppression } from '../../maker-host/rehydrateCloseSuppression';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -9,7 +9,7 @@ import {
   createClaudeIdleReleaseWatcher, createIdleReleaseRuntimeClose, createOrdinaryIdleReleaseTaskCheck,
   DEFAULT_ANTIGRAVITY_IDLE_RELEASE_MINUTES, DEFAULT_CODEX_IDLE_RELEASE_MINUTES,
   ORDINARY_ANTIGRAVITY_TASK_SQL, ORDINARY_CLAUDE_TASK_SQL,
-  ORDINARY_CODEX_TASK_SQL, type IdleClaudeSession, type IdleReleaseAgentKind,
+  ORDINARY_CODEX_TASK_SQL, ORDINARY_PLUGIN_ENGINE_TASK_SQL, type IdleClaudeSession, type IdleReleaseAgentKind,
 } from '../claudeIdleReleaseWatcher';
 import { AgentInputCoordinator } from '../agent-input-coordinator';
 import { hasIdleReleaseQueuedWork, hasPendingIdleReleaseInput, hasScheduledIdleReleaseAutoResume } from '../idleReleaseInputGates';
@@ -214,7 +214,7 @@ function eligibilityDatabase() {
       CREATE TABLE orca_workers (session_id TEXT);
       CREATE TABLE orca_teams (lead_session_id TEXT, status TEXT);
       CREATE TABLE session_goals (session_id TEXT, status TEXT);
-      INSERT INTO sessions VALUES ('task', 'active', 'desktop', '${makerToDbAgentKind('claude-code')}', NULL, NULL, 'native-history', NULL, NULL);
+      INSERT INTO sessions VALUES ('task', 'active', 'desktop', '${makerToDbEngineKind('claude-code')}', NULL, NULL, 'native-history', NULL, NULL);
     `);
     return db;
 }
@@ -275,13 +275,14 @@ describe('ordinary task eligibility in SQLite', () => {
   it.each([
     ['codex', ORDINARY_CODEX_TASK_SQL],
     ['antigravity', ORDINARY_ANTIGRAVITY_TASK_SQL],
+    ['acp', ORDINARY_PLUGIN_ENGINE_TASK_SQL],
   ] as const)('scopes the %s query to resumable local tasks and preserves task data', (kind, sql) => {
     const db = eligibilityDatabase();
     try {
       const eligible = db.prepare(sql);
       expect(eligible.readonly).toBe(true);
       expect(eligible.get('task', 'native-history')).toBeUndefined();
-      db.prepare('UPDATE sessions SET agent_kind = ?').run(makerToDbAgentKind(kind));
+      db.prepare('UPDATE sessions SET agent_kind = ?').run(makerToDbEngineKind(kind));
       expect(eligible.get('task', 'native-history')).toEqual({ id: 'task' });
       expect(eligible.get('task', 'stale-history')).toBeUndefined();
       expect(db.prepare(ORDINARY_CLAUDE_TASK_SQL).get('task', 'native-history')).toBeUndefined();
@@ -289,8 +290,14 @@ describe('ordinary task eligibility in SQLite', () => {
         .toEqual({ status: 'active', sdk_session_id: 'native-history' });
       db.exec("UPDATE sessions SET source = 'scheduler'");
       if (kind === 'codex') expect(eligible.get('task', 'native-history')).toEqual({ id: 'task' });
+      if (kind === 'acp') {
+        expect(eligible.get('task', 'native-history')).toBeUndefined();
+        db.exec("UPDATE sessions SET source = 'desktop'; INSERT INTO orca_workers VALUES ('task')");
+        expect(eligible.get('task', 'native-history')).toBeUndefined();
+        db.exec('DELETE FROM orca_workers');
+      }
       db.exec("INSERT INTO bot_session_links VALUES ('task')");
-      if (kind === 'codex') expect(eligible.get('task', 'native-history')).toBeUndefined();
+      if (kind !== 'antigravity') expect(eligible.get('task', 'native-history')).toBeUndefined();
       db.exec("UPDATE sessions SET source = 'bot'");
       if (kind === 'antigravity') {
         expect(eligible.get('task', 'native-history')).toEqual({ id: 'task' });
@@ -501,6 +508,78 @@ it('keeps a scheduled Codex Session while native work lives, then releases and r
     db.close();
     await maker.shutdown();
     suppression.resetForTest();
+  }
+});
+
+// Plugin engine (ACP) tasks: each holds one engine process that never exited when idle, so every
+// task ever opened kept its process (2026-11-25). Release goes through
+// real Maker/Session: a runtime whose agent cannot reopen the conversation, or does not say, is
+// kept; a reopenable one is released and the next send resumes the same native session.
+it.each([
+  { name: 'cannot reopen', canResume: false, released: false },
+  { name: 'does not say', canResume: undefined, released: false },
+  { name: 'can reopen', canResume: true, released: true },
+])('releases an idle plugin engine task only when its agent $name', async ({ canResume, released }) => {
+  const rows = new Map<string, SessionMeta>();
+  const storage: SessionStorage = {
+    create: async meta => { const row = { ...meta, createdAt: 1, updatedAt: 1 }; rows.set(meta.id, row); return row; },
+    get: async id => rows.get(id) ?? null,
+    list: async () => [...rows.values()],
+    update: async (id, patch) => { const row = { ...rows.get(id)!, ...patch }; rows.set(id, row); return row; },
+    delete: vi.fn(async id => { rows.delete(id); }),
+    compareAndClearSdkSessionId: async () => false,
+  };
+  const log = { trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}, child() { return this; } };
+  const handles: AgentSessionHandle[] = [];
+  const startSession = vi.fn(async (opts: StartSessionOptions) => {
+    let finish!: () => void;
+    const ended = new Promise<void>(resolve => { finish = resolve; });
+    const handle: AgentSessionHandle = {
+      id: opts.resumeSessionId ?? 'acp-session', agentKind: 'acp', model: 'model',
+      send: vi.fn(async () => {}), steer: async () => {}, abort: async () => {},
+      getUsageSnapshot: () => ({ tokenUsage: 0, contextTokens: 0, contextWindow: 0, costUsd: 0 }),
+      close: vi.fn(async () => { finish(); }),
+      async *events() { await ended; },
+      isTurnRunning: () => false, setInteractionResolver() {},
+      hasLiveBackgroundWork: async () => false,
+      ...(canResume === undefined ? {} : { canResumeAfterClose: () => canResume }),
+    } as AgentSessionHandle;
+    handles.push(handle);
+    return handle;
+  });
+  const agent = { kind: 'acp', capabilities: { sameTurnSteer: { supported: false } }, startSession,
+    filterActiveSkillCommands: (result: unknown) => result, dispose: async () => {} } as unknown as BaseAgent;
+  const maker = new Maker({ agents: { acp: agent }, storage, logger: log });
+  const opts = { id: 'task', agentKind: 'acp' as const, providerId: 'acp-plugin:engine:agent',
+    workingDir: path.join(os.tmpdir(), 'acp-idle-fixture'), model: 'model' };
+  const first = await maker.createSession(opts);
+  let now = 0;
+  const watcher = createClaudeIdleReleaseWatcher({
+    agentKind: 'acp',
+    listSessions: () => maker.listActiveSessions(), getSession: id => maker.getSession(id),
+    readMinutes: () => 30,
+    isOrdinaryTask: async (id, nativeId) => (await storage.get(id))?.sdkSessionId === nativeId,
+    hasPendingInput: async () => false, isHostBusy: () => false,
+    withLock: async (_id, fn) => fn(),
+    close: async (session) => await maker.closeSessionIfCurrent(session as typeof first, 'runtime-refresh', { onlyIfIdle: true }) === 'closed',
+    now: () => now, released: vi.fn(), warn: log.warn,
+  });
+  try {
+    await watcher.scanNow(); now = 30 * 60_000; await watcher.scanNow();
+    now += 30 * 60_000; await watcher.scanNow();
+    expect(vi.mocked(handles[0].close).mock.calls.length).toBe(released ? 1 : 0);
+    expect(maker.getSession('task') === first).toBe(!released);
+    if (released) {
+      expect(storage.delete).not.toHaveBeenCalled();
+      const persisted = (await maker.getSessionMeta('task'))!;
+      const resumed = await maker.createSession({ ...opts, resumeSessionId: persisted.sdkSessionId });
+      expect(startSession.mock.calls[1][0].resumeSessionId).toBe('acp-session');
+      await resumed.send('continue');
+      expect(handles[1].send).toHaveBeenCalledOnce();
+    }
+  } finally {
+    watcher.stop();
+    await maker.shutdown();
   }
 });
 

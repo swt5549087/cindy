@@ -37,9 +37,13 @@ describe('disabled Cindy Make execution', () => {
     const prepareSharedTaskInput = vi.fn();
     const inputCoordinator = { getGeneration: vi.fn(), enqueue: vi.fn(), steer: vi.fn(), resume: vi.fn(), retryLastError: vi.fn() };
     const readSessionSource = vi.fn(async () => sessionSource);
+    const assertAvailable = bind(expressionMatching(node =>
+      isFunctionDeclaration(node) && node.name?.text === 'assertReviewExternalInputAvailable' ? node : undefined,
+    ), { readSessionSource, assertCindyMakeSessionAvailable, assertReviewSessionExternalInputAllowed });
+    const takeOverLocalAgentVisibleSession = vi.fn();
     const assertExternalInput = bind(expressionMatching(node =>
       isFunctionDeclaration(node) && node.name?.text === 'assertReviewExternalInputAllowed' ? node : undefined,
-    ), { readSessionSource, assertCindyMakeSessionAvailable, assertReviewSessionExternalInputAllowed });
+    ), { assertReviewExternalInputAvailable: assertAvailable, takeOverLocalAgentVisibleSession });
     const assertRemoteInputControlBoundary = bind(expressionMatching(node =>
       isVariableDeclaration(node) && node.name.getText(source) === 'assertRemoteInputControlBoundary' ? node.initializer : undefined,
     ), { assertReviewExternalInputAllowed: assertExternalInput, inputCoordinator });
@@ -53,6 +57,7 @@ describe('disabled Cindy Make execution', () => {
       await expect(handler({}, 'old-make', {})).rejects.toThrow(/\[UNSUPPORTED_CAPABILITY\]/);
     }
     expect(prepareSharedTaskInput).not.toHaveBeenCalled();
+    expect(takeOverLocalAgentVisibleSession).not.toHaveBeenCalled();
     for (const action of Object.values(inputCoordinator)) expect(action).not.toHaveBeenCalled();
   });
 });

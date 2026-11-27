@@ -94,3 +94,26 @@
 缺少可信回执返回 `DELIVERY_UNKNOWN`，不自动重放、不重建连接、不影响同设备其他任务。
 只有两类操作请求使用既有交互名额，能力探测和回执校验沿用原名额。沿用同一通道和加密
 invoke 格式，自建中转透明转发，新旧客户端共用现有中转，无需服务端或 Mobile 原生更新。
+
+## Node Host 接收普通任务
+
+Node Host 在同账号 Device Link 注册同一组 `maker:session:handoff` 操作，声明
+`taskActionVersion: 1`、`plainRequestBody: 1`、`pluginCaller: 1`、
+`ordinaryCreateVersion: 1` 和 `projectCatalogVersion: 1`。控制桌面沿用现有的能力探测和参数；
+未接入的旧 Host 仍拒绝此通道。Host 未声明 `ordinaryCreateAutoTitle`，控制端沿用生成短标题的兼容路径。
+回执复核沿原通道向发送电脑请求，使用现有后台链路，不订阅推送。关远控、撤权、换账号或换资料所有权后，
+先前入队的消息无法继续通过复核。目标在最终入队检查中已不存在或不可用时返回
+`NOT_FOUND`，并走原有未投递回执释放。
+Desktop 可向未被接管、可见的普通伙伴任务投递，内部群会话另有准入限制。
+Node Host 的伙伴执行链尚未接入，本阶段只对普通任务开放投递，伙伴目标返回 `NOT_FOUND`。
+
+`list_available_models(device)` 沿用 `maker:orca:remote-worker:models` 的请求和模型目录回包，
+只列 Host 已连接且能在本机执行的模型。Orca Worker 的能力探测、创建和桥接归独立的运行时接入，
+Host 在此阶段仍不声明 Worker 执行能力。共享任务访客不获准调用上述通道。
+
+注意先读取历史再决定是否重发。Node Host 实现现有的单任务只读通道
+`local-db:history:messages`，供 `get_chat_history` 按完整任务 ID 读取结果及核对未知投递。
+两端复用参数校验、游标、分页预算、错误正文脱敏和终态提示，并走同账号远控、撤权及任务可见性检查。
+
+未新增 wire 字段或中转处理，自建中转继续透传同样的 invoke 和 invoke-result。
+回归覆盖 `apps/host/src/device-link.test.mjs` 的回环设备连接及 `apps/host/src/agent/input-queue.test.mjs` 的排队撤销。

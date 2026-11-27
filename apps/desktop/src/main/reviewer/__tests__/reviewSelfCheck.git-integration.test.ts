@@ -75,7 +75,8 @@ it('reviews real committed and dirty code in the Bash worktree despite an empty 
   await git(['commit', '--no-gpg-sign', '-s', '-m', 'committed change'], actual);
   await fs.writeFile(path.join(actual, 'dirty.ts'), 'export const current = 0;\n');
 
-  let commands = [JSON.stringify({ toolName: 'Bash', input: { command: `cd "${actual}" && git status --short` } })];
+  const bashPath = actual.split(path.sep).join('/');
+  let commands = [JSON.stringify({ toolName: 'Bash', input: { command: `cd "${bashPath}" && git status --short` } })];
   runtime.resolveScope.mockImplementation((sessionId: string) => resolveReviewScope(sessionId, {
     getSessionRow: async () => ({ id: 'source', workingDir: main, worktreePath: null, remoteHostId: null }),
     getManagedWorktreePath: () => null,

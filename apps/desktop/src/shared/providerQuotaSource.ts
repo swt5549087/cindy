@@ -1,7 +1,7 @@
 import { isKimiCodingProviderView } from './kimiCodingUsage';
 import { isOpenCodeGoProviderView } from './opencodeGoUsage';
 import { ANTIGRAVITY_SUBSCRIPTION_PROVIDER_ID } from './antigravityAccounts';
-import type { ProviderView } from '@cindy/model-providers';
+import { isOpenAiSubscriptionProvider, type ProviderView } from '@cindy/model-providers';
 
 /**
  * Which subscription usage reader describes a connection, or null when Cindy cannot read
@@ -21,8 +21,10 @@ export function providerWeeklyQuotaSource(
   )
     return null;
   if (provider.id === ANTIGRAVITY_SUBSCRIPTION_PROVIDER_ID) return 'antigravity';
-  if (provider.id === 'openai' || provider.auth.native === 'codex') return 'codex';
-  if (provider.auth.native === 'claude') return 'claude';
+  // Providers Cindy creates for subscription accounts (`openai-sub-*` / `anthropic-sub-*`) copy
+  // the built-in entry without its id or a native marker; `subscriptionPool` identifies them.
+  if (isOpenAiSubscriptionProvider(provider)) return 'codex';
+  if (provider.auth.native === 'claude' || provider.subscriptionPool === 'anthropic') return 'claude';
   if (provider.auth.native === 'xai') return 'xai';
   // These APIs currently describe only the built-in native account, not any
   // arbitrary same-brand API/OAuth connection a user may add.
@@ -30,4 +32,13 @@ export function providerWeeklyQuotaSource(
   if (provider.id === 'anthropic') return 'claude';
   if (provider.id === 'xai') return 'xai';
   return null;
+}
+
+/**
+ * The reader to use on the per-provider usage channels (this computer's readers and
+ * `maker:usage:*` on another one). Those resolve built-in and native connections only: accounts
+ * of providers Cindy created for subscription accounts are read from the account pool instead.
+ */
+export function providerUsageReaderSource(provider: ProviderView): ReturnType<typeof providerWeeklyQuotaSource> {
+  return provider.subscriptionPool ? null : providerWeeklyQuotaSource(provider);
 }

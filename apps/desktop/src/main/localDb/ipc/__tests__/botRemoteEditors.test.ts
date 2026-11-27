@@ -354,9 +354,9 @@ it('lists and switches only the automations of the teammate project', async () =
     pause: vi.fn(async (id: string) => set(id, 'paused')), resume: vi.fn(async (id: string) => set(id, 'active')),
   };
   const list = await f.resource('settings:bot-a/automations');
-  expect(f.entries(list, 'automations')).toEqual([
-    expect.objectContaining({ id: 'paused', subtitle: '每天 09:00 · 已暂停' }),
-    expect.objectContaining({ id: 'own', subtitle: '每天 09:00' }),
+  expect(f.entries(list, 'automations').map(({ id, subtitle }) => [id, subtitle]).sort()).toEqual([
+    ['own', '每天 09:00'],
+    ['paused', '每天 09:00 · 已暂停'],
   ]);
   await expect(f.resource('settings:bot-a/automations/other')).rejects.toThrow();
   await f.send(await f.resource('settings:bot-a/automations/own'), { active: false });

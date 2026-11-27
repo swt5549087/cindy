@@ -757,6 +757,7 @@ describe('event types the desktop pipeline acts on, classified for the Host', ()
   const EVENT_TYPE_PARITY: Record<string, { host?: string; gaps?: string[]; platform?: string }> = {
     account_usage: { gaps: ['row 13 (Codex account_usage snapshot)'] },
     agent_task_update: { host: 'turn-executor.mjs noteBackgroundActivity; history.event (sessionEventStreamCore, shared)' },
+    antigravity_tool_activity: { platform: 'Desktop Antigravity native tool activity; Node Host does not run Antigravity' },
     compact_boundary: { host: 'turn-executor.mjs wireNotes.reset' },
     done: {
       host: 'turn-executor.mjs finish: flush, Codex plan, change record, Git savepoint, turn end',
@@ -768,12 +769,17 @@ describe('event types the desktop pipeline acts on, classified for the Host', ()
     },
     image: { host: 'turn-executor.mjs deliverCodexGeneratedImage (agent/generated-images.ts over the shared generatedImageDelivery.ts)' },
     interaction_dismissed: { host: 'turn-executor.mjs handleInteractionDismissedEvent (sessionEventPreparationSteps.ts, shared), in or out of a turn' },
+    interaction_request: { host: 'interactions.mjs scoped pending interaction and push' },
     plan_mode_changed: { host: 'turn-executor.mjs persistAgentPlanModeChange (shared persistAgentPlanModeChangeWith)' },
     status: {
       host: 'turn-executor.mjs context snapshot (shared), background activity',
       gaps: ['smaller difference: running=false alone does not write the turn end time'],
     },
     text: { host: 'history.event (sessionEventStreamCore, shared); turn-executor.mjs routeStandaloneTextEvent (sessionEventPreparationSteps.ts, shared)' },
+    thinking: { host: 'history.event (sessionEventStreamCore, shared)' },
+    tool_result: { host: 'history.event (sessionEventStreamCore, shared)' },
+    tool_result_full: { host: 'history.event (sessionEventStreamCore, shared)' },
+    tool_use: { host: 'history.event (sessionEventStreamCore, shared)' },
     turn_diff: { host: 'turn-executor.mjs noteTurnDiffEvent, not published' },
   };
 

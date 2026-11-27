@@ -9,6 +9,8 @@ vi.mock('electron', () => ({
 }));
 
 vi.mock('../../appSessionState.js', () => ({
+  activeOwnerScopeKey: () => 'owner:test',
+  isAppSessionBoundaryPending: () => false,
   ownerScopedUserDataPath: (...parts: string[]) => ['/tmp/xdt-test-user-data', ...parts].join('/'),
 }));
 

@@ -12,6 +12,7 @@ import { activeOwnerScopeKey, getActiveAppSession, isAppSessionBoundaryPending }
 import { createLogger } from '../logger.js';
 import { MAKER_INVOKE, MAKER_PUSH } from './channels.js';
 import type { AntigravityLoginTarget } from '../../shared/antigravityAccounts.js';
+import { cloudManagementExecution } from '../host-settings/managementCalls.js';
 import type { IpcHandlerRegistry } from './ipcHandlerRegistry.js';
 
 const log = createLogger('maker-ipc:authHandlers');
@@ -59,6 +60,8 @@ type ActiveLoginOperation = {
   hasUnmanagedOwner: boolean;
   latestDeviceCodeProgress?: CodexDeviceCodeProgressPayload;
   cancellation?: Promise<void>;
+  /** Cloud settings page: the device code is shown on the controlling computer. */
+  presentDeviceCode?: (payload: CodexDeviceCodeProgressPayload) => void;
 };
 
 type LoginOwner = {
@@ -319,6 +322,7 @@ export function registerMakerAuthHandlers(
           ...deviceCode,
         };
         operation.latestDeviceCodeProgress = payload;
+        operation.presentDeviceCode?.(payload);
         broadcast(MAKER_PUSH.AUTH_LOGIN_PROGRESS, payload);
       },
     }).catch(error => {
@@ -462,9 +466,14 @@ export function registerMakerAuthHandlers(
       authorizeGoogle(kind, event);
       const { mode, ownerId, googleTarget } = requireLoginOptions(kind, rawOptions);
       assertGoogleTarget(googleTarget);
+      // A cloud settings page can only complete a device-code login; a browser would open
+      // on the cloud desktop instead of the controlling computer.
+      const management = cloudManagementExecution();
+      if (management && (kind !== 'codex' || mode !== 'device-code'))
+        throwIpcError('INVALID_PARAMS', 'cloud login uses the codex device code');
       const sender = readController(event);
       const current = activeLoginOperations.get(kind);
-      if (current?.acceptingOwners && !current.settledFlag && current.mode === mode && current.googleTarget?.accountId === googleTarget?.accountId
+      if (!management && current?.acceptingOwners && !current.settledFlag && current.mode === mode && current.googleTarget?.accountId === googleTarget?.accountId
         && current.googleTarget?.ownerGeneration === googleTarget?.ownerGeneration) {
         registerLoginOwner(kind, current, sender, ownerId);
         // Device URL/code may have been emitted before this BrowserWindow joined the shared
@@ -489,7 +498,19 @@ export function registerMakerAuthHandlers(
         settledFlag: false,
         ownerIds: new Set(),
         hasUnmanagedOwner: false,
+        ...(management
+          ? {
+              presentDeviceCode: (payload: CodexDeviceCodeProgressPayload) =>
+                management.prompt({
+                  kind: 'device',
+                  url: payload.verificationUrl,
+                  userCode: payload.userCode,
+                  expiresAt: Date.now() + 15 * 60_000,
+                }),
+            }
+          : {}),
       };
+      management?.onCancel(() => void cancelLoginOperation(kind, activeOperation));
       registerLoginOwner(kind, activeOperation, sender, ownerId);
       if (current) current.acceptingOwners = false;
       activeLoginOperations.set(kind, activeOperation);

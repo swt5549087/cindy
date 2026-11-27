@@ -184,7 +184,10 @@ describe('maker:session:handoff (receiving computer)', () => {
     let shared = false;
     const validate = vi.fn((_sender: string, input: Parameters<typeof validateRemoteTaskActionReceipt>[1]) =>
       validateRemoteTaskActionReceipt('parent-device', input));
-    const receive = createSessionHandoffHandler({ send, validate, canReceiveTaskStatusReceipt: () => !shared });
+    const assertAccess = vi.fn();
+    const receive = createSessionHandoffHandler({
+      send, validate, captureAccess: () => assertAccess, canReceiveTaskStatusReceipt: () => !shared,
+    });
     const invoke = vi.fn<Parameters<typeof createRemoteSessionHandoff>[0]['invoke']>(async (_device, _channel, args) =>
       (args[0] as { action?: string }).action === 'task-action-capability'
       ? { ok: true as const, result: { taskActionVersion: 1, ...(supported ? { taskStatusReceipt: 1 } : {}) } }
@@ -202,7 +205,8 @@ describe('maker:session:handoff (receiving computer)', () => {
       return;
     }
     expect(result).toMatchObject({ ok: true, wakeKind: 'queued' });
-    expect(validate).toHaveBeenCalledWith('child-device', expect.objectContaining({ operation: TASK_STATUS_RECEIPT_OPERATION }));
+    expect(validate).toHaveBeenCalledWith('child-device', expect.objectContaining({ operation: TASK_STATUS_RECEIPT_OPERATION }), assertAccess);
+    expect(assertAccess).toHaveBeenCalled();
     const received = send.mock.calls[0]![0];
     expect(received).toMatchObject({ inheritTargetPlanMode: true, origin: {
       kind: 'session', senderSessionId: 'child-device::child', automaticTaskReceipt: true,
@@ -253,7 +257,7 @@ describe('maker:session:handoff (receiving computer)', () => {
       .toMatchObject({ ok: false, errorCode: failure === 'write' ? 'DELIVERY_UNKNOWN' : 'INVALID_ARGS' });
     expect(insert).toHaveBeenCalledTimes(failure === 'write' ? 1 : 0);
     expect(deps.discardWorktree).toHaveBeenCalledTimes(failure === 'authorization' ? 1 : 0);
-    if (failure === 'authorization') expect(deps.discardWorktree).toHaveBeenCalledWith(id);
+    if (failure === 'authorization') expect(deps.discardWorktree).toHaveBeenCalledWith(id, '/destination/worktree', expect.any(Function));
     expect(rows.size).toBe(0);
   });
 
